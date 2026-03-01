@@ -37,15 +37,15 @@ Revolutionary hierarchical scheduler allowing multiple scheduling policies to co
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│              Main Preemptive Scheduler                   │
+│              Main Preemptive Scheduler                  │
 │  (O(1) bitmap, handles domain selection & preemption)   │
 └────────┬──────────┬──────────┬──────────┬───────────────┘
          │          │          │          │
-    ┌────▼────┐┌────▼────┐┌────▼────┐┌────▼────┐
-    │  COOP   ││REALTIME ││  BATCH  ││  IDLE   │
-    │ Domain  ││ Domain  ││ Domain  ││ Domain  │
-    │(fibers) ││(deadline)││(low pri)││(bg jobs)│
-    └─────────┘└─────────┘└─────────┘└─────────┘
+    ┌────▼────┐┌────▼─────┐┌────▼────┐┌────▼─────┐
+    │  COOP   ││REALTIM E ││  BATCH  ││  IDLE    │
+    │ Domain  ││ Domain   ││ Domain  ││ Domain   │
+    │(fibers) ││(deadline)││(low pri)││(bg jobs) │
+    └─────────┘└──────────┘└─────────┘└──────────┘
 ```
 
 **Pluggable Scheduler Classes:**
@@ -206,7 +206,7 @@ VBoxManage storageattach picomimi-x64 --storagectl "IDE" --port 0 --device 0 \
 ## Project Structure
 
 ```
-picomimi-x64/
+Picomimi-x64/
 ├── arch/x86_64/
 │   ├── boot/           # Boot code (Multiboot2, GDT, long mode)
 │   ├── idt/            # IDT, interrupt handlers, PIC/PIT
