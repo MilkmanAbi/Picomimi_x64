@@ -298,19 +298,19 @@ picomimi:/#
 
 ## Comparison with Picomimi-AxisOS
 
-| Feature | Picomimi-AxisOS (RP2040) | Picomimi-x64 |
+| Feature | Picomimi (ARM-32) | Picomimi-x64 |
 |---------|--------------------------|--------------|
-| Architecture | ARM Cortex-M0+ | x86_64 |
+| Architecture | ARM Cortex-M | x86_64 |
 | Word Size | 32-bit | 64-bit |
 | Memory Model | Flat | Virtual (4-level paging) |
-| Scheduler | O(1) Bitmap | O(1) Bitmap + Hypervisor |
-| Scheduler Domains | N/A | RT, Fair, Batch, Idle, Coop |
-| Syscalls | Custom | Linux ABI (512 syscalls) |
-| Cores | 2 | SMP-ready |
-| Max RAM | 264KB | 16EB theoretical |
-| Boot | Direct | GRUB/Multiboot2 |
+| Scheduler | O(1) Bitmap + Hypervisor | O(1) Bitmap + Hypervisor |
+| Scheduler Domains | Piority Cooperative | RT, Fair, Batch, Idle, Coop |
+| Syscalls | Custom Picomimi | Linux ABI (512 syscalls) |
+| Cores | 2, SMP (expansable) | SMP-ready |
+| Max RAM | 512KB (PSRAM expandable) | x64 limit |
+| Boot | MimiBoot/Direct | GRUB/Multiboot2 |
 | Terminal | Basic | Full ANSI/VT100 |
-| Shell | N/A | Built-in (ksh) |
+| Shell | MimiShell | Built-in (ksh) |
 
 ## Future Plans
 
