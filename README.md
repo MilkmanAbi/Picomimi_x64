@@ -1,7 +1,7 @@
 # Picomimi-x64 Kernel
 
 A x86_64 kernel inspired by [Picomimi-AxisOS](https://github.com/MilkmanAbi/picomimi-axisos), 
-the microkernel OS for ARM Cortex-M microcontrollers. (Based off unreleased internal Picomimi dev releases, v16 and v17.8)
+the microkernel OS for ARM Cortex-M microcontrollers. (Based off unreleased internal Picomimi dev releases, v16 and v17.8). Picomimi-x64 IS NOT BASED OFF LINUX, it is a custom hobbyist kernel, it borrows syscall and API names from Linux but it is coded from the ground up.
 
 >**Note:** I am passionate about systems engineering, kernel development, and the ARM and RISC-V ISAs. I enjoy working with basic assembly, but I have no interest in x64, absolutely none. Picomimi-x64 was created purely for fun and learning, with extensive AI assistance to get it running on x64. It is a fork of my original project, Picomimi, which I developed for ARM Cortex-M MCUs. Picomimi features fully custom schedulers, dynamic memory management, syscalls, APIs, and many other components I built from scratch. I use AI not to replace my work but because I simply don’t care for x86 and don’t have the time or motivation to master it. I have school, I simply don't care enough to fully master x86 in between juggling assignments when x86 isn't even my passion, I'm open about it. This project is a fun little hobby project, will NEVER be proffessional nor be used anywhere whatsoever, most hobbyist OSes don't, I know this is a fun little project and I treat it as such, I use AI to help get x64 working while I write actual Kernel code.
 
