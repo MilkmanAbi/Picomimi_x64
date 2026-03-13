@@ -473,41 +473,149 @@ s64 sys_setdomainname(const char *name, size_t len) {
 #define FUTEX_CLOCK_RT      256
 #define FUTEX_CMD_MASK      (~(FUTEX_PRIVATE_FLAG|FUTEX_CLOCK_RT))
 
+/* =========================================================
+ * Futex hash table — maps user address → list of waiting tasks
+ * ========================================================= */
+
+#define FUTEX_HASH_BITS  8
+#define FUTEX_HASH_SIZE  (1 << FUTEX_HASH_BITS)
+#define FUTEX_HASH_MASK  (FUTEX_HASH_SIZE - 1)
+
+typedef struct futex_waiter {
+    u32                *uaddr;          /* user-space futex address */
+    u32                 val;            /* value we were waiting for */
+    task_struct_t      *task;
+    struct futex_waiter *next;
+} futex_waiter_t;
+
+static futex_waiter_t *futex_hash[FUTEX_HASH_SIZE];
+
+static unsigned int futex_hash_key(u32 *uaddr) {
+    u64 h = (u64)(uintptr_t)uaddr;
+    h ^= h >> 12;
+    h ^= h >> 7;
+    return (unsigned int)(h & FUTEX_HASH_MASK);
+}
+
 s64 sys_futex(u32 *uaddr, int op, u32 val,
                const struct timespec *timeout,
                u32 *uaddr2, u32 val3) {
-    (void)uaddr2; (void)val3; (void)timeout;
+    (void)uaddr2; (void)val3;
 
     if (!uaddr) return -EFAULT;
 
     int cmd = op & FUTEX_CMD_MASK;
 
     switch (cmd) {
-    case FUTEX_WAIT:
-        /* If *uaddr == val, sleep until woken */
-        if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val)
-            return -EAGAIN;
-        /* Spin wait — a real implementation would block */
-        {
-            u64 deadline = jiffies + (timeout ? 100 : 1000); /* ~1-10s */
-            while ((s64)(deadline - jiffies) > 0) {
-                if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val)
-                    return 0;
-                if (current && signal_pending(current)) return -EINTR;
-                __asm__ volatile("pause");
+
+    case FUTEX_WAIT: {
+        /* Atomically check: if *uaddr != val, return EAGAIN immediately */
+        u32 cur = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
+        if (cur != val) return -EAGAIN;
+
+        /* Register ourselves as a waiter so FUTEX_WAKE can find us */
+        task_struct_t *me = get_current_task();
+
+        futex_waiter_t waiter;
+        waiter.uaddr = uaddr;
+        waiter.val   = val;
+        waiter.task  = me;
+        waiter.next  = NULL;
+
+        unsigned int slot = futex_hash_key(uaddr);
+        waiter.next = futex_hash[slot];
+        futex_hash[slot] = &waiter;
+
+        /* Compute timeout */
+        u64 deadline = 0;
+        if (timeout) {
+            extern volatile u64 jiffies;
+            deadline = jiffies + (u64)(timeout->tv_sec * 1000) +
+                       (u64)(timeout->tv_nsec / 1000000);
+        }
+
+        extern void schedule(void);
+
+        /* Yield-wait loop — stay TASK_RUNNING so scheduler keeps us alive */
+        while (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) == val) {
+            if (me && signal_pending(me)) {
+                futex_waiter_t **pp = &futex_hash[slot];
+                while (*pp) { if (*pp == &waiter) { *pp = waiter.next; break; } pp = &(*pp)->next; }
+                return -EINTR;
+            }
+            if (deadline) {
+                extern volatile u64 jiffies;
+                if ((s64)(jiffies - deadline) >= 0) {
+                    futex_waiter_t **pp = &futex_hash[slot];
+                    while (*pp) { if (*pp == &waiter) { *pp = waiter.next; break; } pp = &(*pp)->next; }
+                    return -ETIMEDOUT;
+                }
+            }
+            schedule();
+        }
+
+        /* Woken or value changed */
+        futex_waiter_t **pp = &futex_hash[slot];
+        while (*pp) { if (*pp == &waiter) { *pp = waiter.next; break; } pp = &(*pp)->next; }
+        return 0;
+    }
+
+    case FUTEX_WAKE: {
+        /* Wake up to val waiters blocked on uaddr */
+        unsigned int slot = futex_hash_key(uaddr);
+        int woken = 0;
+        futex_waiter_t **pp = &futex_hash[slot];
+        while (*pp && woken < (int)val) {
+            futex_waiter_t *w = *pp;
+            if (w->uaddr == uaddr) {
+                /* Remove from list and wake */
+                *pp = w->next;
+                w->next = NULL;
+                set_task_state(w->task, TASK_RUNNING);
+                extern void wake_up_process(task_struct_t *task);
+                wake_up_process(w->task);
+                woken++;
+            } else {
+                pp = &w->next;
             }
         }
-        return -ETIMEDOUT;
+        return (s64)woken;
+    }
 
-    case FUTEX_WAKE:
-        /* Wake up to val waiters — since we're single-threaded in userspace,
-         * just return the number we'd wake */
-        return (s64)(val > 0 ? 1 : 0);
+    case FUTEX_REQUEUE: {
+        /* REQUEUE: wake val waiters on uaddr, requeue rest to uaddr2 */
+        if (!uaddr2) return -EFAULT;
+        unsigned int slot  = futex_hash_key(uaddr);
+        unsigned int slot2 = futex_hash_key(uaddr2);
+        int woken = 0, requeued = 0;
+        futex_waiter_t **pp = &futex_hash[slot];
+        while (*pp) {
+            futex_waiter_t *w = *pp;
+            if (w->uaddr != uaddr) { pp = &w->next; continue; }
+            *pp = w->next;
+            if (woken < (int)val) {
+                w->next = NULL;
+                set_task_state(w->task, TASK_RUNNING);
+                extern void wake_up_process(task_struct_t *task);
+                wake_up_process(w->task);
+                woken++;
+            } else {
+                /* Requeue to uaddr2's bucket */
+                w->uaddr = uaddr2;
+                w->next  = futex_hash[slot2];
+                futex_hash[slot2] = w;
+                requeued++;
+            }
+        }
+        return (s64)woken;
+    }
 
     default:
         return -ENOSYS;
     }
 }
+
+
 
 /* =========================================================
  * select / poll — simplified implementations
@@ -529,52 +637,64 @@ typedef struct {
 s64 sys_select(int nfds, void *readfds, void *writefds, void *exceptfds,
                struct timeval *timeout) {
     (void)exceptfds;
-    /* Simplified: check all listed fds immediately (no blocking) */
     if (nfds < 0 || nfds > 1024) return -EINVAL;
 
     fd_set_t *rfds = (fd_set_t *)readfds;
     fd_set_t *wfds = (fd_set_t *)writefds;
 
-    int ready = 0;
-
-    for (int fd = 0; fd < nfds; fd++) {
-        if (rfds && FD_ISSET(fd, rfds)) {
-            file_t *f = fget((unsigned int)fd);
-            if (!f) { FD_CLR(fd, rfds); continue; }
-            /* Assume readable if it has data (simplified: always ready) */
-            ready++;
-            fput(f);
-        }
-        if (wfds && FD_ISSET(fd, wfds)) {
-            file_t *f = fget((unsigned int)fd);
-            if (!f) { FD_CLR(fd, wfds); continue; }
-            ready++;
-            fput(f);
+    /* Compute deadline (0 = no timeout = block forever) */
+    extern volatile u64 jiffies;
+    u64 deadline = 0;
+    bool has_timeout = false;
+    if (timeout) {
+        has_timeout = true;
+        u64 ticks = (u64)timeout->tv_sec * 1000ULL +
+                    (u64)timeout->tv_usec / 1000ULL;
+        deadline = jiffies + ticks;
+        if (timeout->tv_sec == 0 && timeout->tv_usec == 0) {
+            /* Pure non-blocking poll */
+            deadline = jiffies;
         }
     }
 
-    if (ready == 0 && timeout && timeout->tv_sec == 0 && timeout->tv_usec == 0)
-        return 0;   /* Non-blocking: nothing ready */
+    task_struct_t *me = get_current_task();
+    extern void schedule(void);
 
-    /* For blocking select: spin until timeout */
-    if (ready == 0 && timeout) {
-        u64 ns = (u64)timeout->tv_sec * NSEC_PER_SEC +
-                 (u64)timeout->tv_usec * NSEC_PER_USEC;
-        u64 ticks = ns / NSEC_PER_JIFFIE;
-        u64 deadline = jiffies + ticks;
-        while ((s64)(deadline - jiffies) > 0) {
-            if (current && signal_pending(current)) return -EINTR;
-            __asm__ volatile("hlt");
+    while (1) {
+        int ready = 0;
+
+        for (int fd = 0; fd < nfds; fd++) {
+            if (rfds && FD_ISSET(fd, rfds)) {
+                file_t *f = fget((unsigned int)fd);
+                if (!f) { FD_CLR(fd, rfds); continue; }
+                /* TTY / pipe: check if there's data */
+                int has_data = 1;
+                if (f->f_op && f->f_op->poll)
+                    has_data = (f->f_op->poll(f, NULL) & POLLIN) ? 1 : 0;
+                if (!has_data) FD_CLR(fd, rfds);
+                else ready++;
+                fput(f);
+            }
+            if (wfds && FD_ISSET(fd, wfds)) {
+                file_t *f = fget((unsigned int)fd);
+                if (!f) { FD_CLR(fd, wfds); continue; }
+                /* Assume writable unless closed */
+                ready++;
+                fput(f);
+            }
         }
-    } else if (ready == 0) {
-        /* Block indefinitely */
-        while (true) {
-            if (current && signal_pending(current)) return -EINTR;
-            __asm__ volatile("hlt");
-        }
+
+        if (ready > 0) return (s64)ready;
+
+        /* Check timeout */
+        if (has_timeout && (s64)(jiffies - deadline) >= 0) return 0;
+
+        /* Signal check */
+        if (me && signal_pending(me)) return -EINTR;
+
+        /* Yield to scheduler — stay TASK_RUNNING so we get rescheduled */
+        schedule();
     }
-
-    return (s64)ready;
 }
 
 s64 sys_pselect6(int nfds, void *r, void *w, void *e,
@@ -607,35 +727,47 @@ s64 sys_poll(void *fds_ptr, unsigned int nfds, int timeout_ms) {
     pollfd_t *fds = (pollfd_t *)fds_ptr;
     if (!fds && nfds > 0) return -EFAULT;
 
-    int ready = 0;
-    for (unsigned int i = 0; i < nfds; i++) {
-        fds[i].revents = 0;
-        if (fds[i].fd < 0) continue;
+    extern volatile u64 jiffies;
+    u64 deadline = 0;
+    bool has_timeout = (timeout_ms >= 0);
+    if (has_timeout)
+        deadline = jiffies + (u64)timeout_ms / 10;
 
-        file_t *f = fget((unsigned int)fds[i].fd);
-        if (!f) {
-            fds[i].revents = POLLNVAL;
-            ready++;
-            continue;
+    task_struct_t *me = get_current_task();
+    extern void schedule(void);
+
+    while (1) {
+        int ready = 0;
+        for (unsigned int i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
+            if (fds[i].fd < 0) continue;
+
+            file_t *f = fget((unsigned int)fds[i].fd);
+            if (!f) { fds[i].revents = POLLNVAL; ready++; continue; }
+
+            short rev = 0;
+            if (f->f_op && f->f_op->poll) {
+                unsigned int mask = (unsigned int)f->f_op->poll(f, NULL);
+                if ((fds[i].events & POLLIN)  && (mask & POLLIN))  rev |= POLLIN;
+                if ((fds[i].events & POLLOUT) && (mask & POLLOUT)) rev |= POLLOUT;
+                if (mask & POLLHUP) rev |= POLLHUP;
+                if (mask & POLLERR) rev |= POLLERR;
+            } else {
+                /* No poll op: fd is always ready for whatever was requested */
+                rev = fds[i].events & (POLLIN | POLLOUT | POLLRDNORM);
+            }
+            fds[i].revents = rev;
+            if (rev) ready++;
+            fput(f);
         }
 
-        /* Simplified: assume all fds are ready */
-        if (fds[i].events & POLLIN)  fds[i].revents |= POLLIN;
-        if (fds[i].events & POLLOUT) fds[i].revents |= POLLOUT;
-        if (fds[i].revents) ready++;
+        if (ready > 0) return (s64)ready;
+        if (has_timeout && (s64)(jiffies - deadline) >= 0) return 0;
+        if (me && signal_pending(me)) return -EINTR;
 
-        fput(f);
+        /* Yield — stay TASK_RUNNING so we get rescheduled */
+        schedule();
     }
-
-    if (ready == 0 && timeout_ms != 0) {
-        u64 deadline = jiffies + (u64)(timeout_ms > 0 ? timeout_ms : 1000000) / 10;
-        while ((s64)(deadline - jiffies) > 0) {
-            if (current && signal_pending(current)) return -EINTR;
-            __asm__ volatile("hlt");
-        }
-    }
-
-    return (s64)ready;
 }
 
 s64 sys_ppoll(void *fds, unsigned int nfds, const struct timespec *tmo,

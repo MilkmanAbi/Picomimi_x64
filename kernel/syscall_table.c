@@ -22,6 +22,7 @@
 #include <kernel/process.h>
 #include <kernel/signal.h>
 #include <kernel/timer.h>
+#include <kernel/xnu_compat.h>
 #include <fs/vfs.h>
 #include <lib/printk.h>
 #include <lib/string.h>
@@ -310,6 +311,30 @@ s64 syscall_dispatch(sc_regs_t *regs) {
     u64 a4 = regs->r10;   /* Linux ABI: syscall arg4 = R10, not RCX */
     u64 a5 = regs->r8;
     u64 a6 = regs->r9;
+
+    /* ----------------------------------------------------------------
+     * XNU/Darwin personality: intercept before Linux table lookup.
+     * Mach-O binaries issue syscalls as 0x2000000|bsd_nr (BSD class)
+     * or 0x1000000|mach_nr (Mach class). Linux syscall numbers are
+     * always < 512 so the high bits are unambiguous.
+     * ---------------------------------------------------------------- */
+    if (current && current->personality == PERSONALITY_XNU) {
+        u32 cls = XNU_SYSCALL_CLASS(nr);
+        if (cls == XNU_CLASS_BSD || cls == XNU_CLASS_MACH || cls == XNU_CLASS_MDEP) {
+            /* Store frame for Mach trap use */
+            if (current) current->trap_frame = (trap_frame_t *)regs;
+            s64 ret = xnu_syscall_dispatch(nr, a1, a2, a3, a4, a5, a6);
+            if (current) current->trap_frame = NULL;
+            regs->rax = (u64)ret;
+            if (current && current->sighand) {
+                extern void do_signal(trap_frame_t *frame);
+                do_signal(current->trap_frame);
+            }
+            return ret;
+        }
+        /* Falls through if a Linux-range syscall is issued from XNU task
+         * (e.g. in a compatibility shim that deliberately uses Linux ABI) */
+    }
     /* Trace all syscalls from non-kernel tasks (pids > 1) */
     if (current && current->pid >= 2) {
         static int strace_total = 0;

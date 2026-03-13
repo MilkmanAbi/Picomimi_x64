@@ -6,6 +6,8 @@
 #include <kernel/types.h>
 #include <kernel/process.h>
 #include <kernel/elf.h>
+#include <kernel/macho.h>
+#include <kernel/xnu_compat.h>
 #include <kernel/syscall.h>
 #include <fs/vfs.h>
 #include <mm/pmm.h>
@@ -15,6 +17,11 @@
 #include <lib/string.h>
 #include <arch/cpu.h>
 #include <arch/gdt.h>
+
+/* macho_loader.c */
+extern bool macho_probe_file(file_t *file);
+extern int  macho_load_file(file_t *file, mm_struct_t *mm,
+                             macho_load_info_t *info);
 
 /* elf_loader.c exports */
 extern int  elf_load_segment(file_t *file, const Elf64_Phdr *phdr,
@@ -87,12 +94,96 @@ int do_execve(const char *filename, char *const argv[], char *const envp[]) {
     char **k_argv = copy_strarray(argv, &argc);
     char **k_envp = copy_strarray(envp, &envc);
 
-    /* 2. Open ELF file */
+    /* 2. Open binary file */
     file_t *file = filp_open(k_filename, O_RDONLY, 0);
     if (!file || IS_ERR(file)) { ret = -ENOENT; goto err_free; }
 
+    /* ================================================================
+     * Detect binary format: Mach-O (fat or thin) vs ELF
+     * ================================================================ */
+    if (macho_probe_file(file)) {
+        /* ----------- MACH-O PATH ----------- */
+        mm_struct_t *new_mm = mm_alloc();
+        if (!new_mm) { ret = -ENOMEM; goto err_close; }
+
+        mm_struct_t *old_mm = proc->mm;
+        switch_mm_to(new_mm);
+        proc->mm        = new_mm;
+        proc->active_mm = new_mm;
+
+        macho_load_info_t minfo;
+        ret = macho_load_file(file, new_mm, &minfo);
+        if (ret < 0) { printk(KERN_ERR "[exec] Mach-O failed: %d\n", ret); goto kill_macho; }
+
+        if (minfo.seg_end) {
+            new_mm->end_data  = minfo.seg_end;
+            new_mm->start_brk = PAGE_ALIGN(minfo.seg_end);
+            new_mm->brk       = new_mm->start_brk;
+        }
+
+        /* Build stack — pass a zeroed fake ELF header (no auxv needed for Mach-O) */
+        Elf64_Ehdr fake_ehdr; memset(&fake_ehdr, 0, sizeof(fake_ehdr));
+        fake_ehdr.e_entry     = minfo.entry;
+        fake_ehdr.e_phentsize = sizeof(Elf64_Phdr);
+        u64 user_rsp = 0;
+        if (!build_user_stack(new_mm, (char *const *)k_argv, (char *const *)k_envp,
+                              &fake_ehdr, NULL, 0, 0, &user_rsp)) {
+            ret = -ENOMEM; goto kill_macho;
+        }
+
+        /* Close O_CLOEXEC fds */
+        if (proc->files) {
+            files_struct_t *fs = proc->files;
+            int max = fs->max_fds < MAX_FDS_PER_PROCESS ? fs->max_fds : MAX_FDS_PER_PROCESS;
+            for (int fd = 0; fd < max; fd++) {
+                fd_entry_t *fde = &fs->fd_array[fd];
+                if (fde->file && (u64)fde->file > 0x1000 && (fde->flags & FD_CLOEXEC)) {
+                    filp_close(fde->file, NULL); fde->file = NULL; fde->flags = 0;
+                }
+            }
+        }
+
+        /* Reset signal handlers */
+        if (proc->sighand) {
+            for (int i = 0; i < NSIG; i++) {
+                if (proc->sighand->action[i].sa_handler != SIG_IGN)
+                    memset(&proc->sighand->action[i], 0, sizeof(proc->sighand->action[i]));
+            }
+        }
+
+        /* Tag personality as XNU */
+        proc->personality = PERSONALITY_XNU;
+        if (proc->mach_ports) { kfree(proc->mach_ports); proc->mach_ports = NULL; }
+        proc->mach_task_port = proc->mach_thread_port = 0;
+        /* mach_ports_init_task() called lazily on first Mach trap */
+
+        if (old_mm) mm_free(old_mm);
+
+        /* Commit comm name */
+        { const char *b = k_filename; for (const char *p = k_filename; *p; p++) if (*p == '/') b = p+1;
+          size_t nl = strlen(b); if (nl > 15) nl = 15; memcpy(proc->comm, b, nl); proc->comm[nl] = 0; }
+
+        filp_close(file, NULL);
+        free_strarray(k_argv, argc);
+        free_strarray(k_envp, envc);
+
+        trap_frame_t frame; memset(&frame, 0, sizeof(frame));
+        frame.rip = minfo.entry; frame.cs = USER_CS;
+        frame.rflags = 0x202; frame.rsp = user_rsp; frame.ss = USER_DS;
+        proc->tls = 0;
+        __asm__ volatile("wrmsr" :: "c"(0xC0000100UL), "a"(0), "d"(0));
+        switch_to_user(&frame);
+        __builtin_unreachable();
+    }
+
+    /* ================================================================
+     * ELF PATH (original, unchanged)
+     * ================================================================ */
+
     /* 3. Read + validate ELF header */
-    Elf64_Ehdr *ehdr = kmalloc(sizeof(Elf64_Ehdr), GFP_KERNEL);
+    Elf64_Ehdr *ehdr  = NULL;
+    Elf64_Phdr *phdrs = NULL;
+    ehdr = kmalloc(sizeof(Elf64_Ehdr), GFP_KERNEL);
     if (!ehdr) { ret = -ENOMEM; goto err_close; }
     {
         u64 pos = 0;
@@ -114,7 +205,7 @@ int do_execve(const char *filename, char *const argv[], char *const envp[]) {
 
     /* 4. Read program headers */
     size_t ph_sz = (size_t)ehdr->e_phnum * sizeof(Elf64_Phdr);
-    Elf64_Phdr *phdrs = kmalloc(ph_sz, GFP_KERNEL);
+    phdrs = kmalloc(ph_sz, GFP_KERNEL);
     if (!phdrs) { ret = -ENOMEM; goto err_ehdr; }
     {
         u64 pos = ehdr->e_phoff;
@@ -214,6 +305,11 @@ int do_execve(const char *filename, char *const argv[], char *const envp[]) {
     /* 11. Drop old mm */
     if (old_mm) mm_free(old_mm);
 
+    /* ELF exec: ensure Linux personality (even if previous exec was Mach-O) */
+    proc->personality = PERSONALITY_LINUX;
+    if (proc->mach_ports) { kfree(proc->mach_ports); proc->mach_ports = NULL; }
+    proc->mach_task_port = proc->mach_thread_port = 0;
+
     kfree(phdrs);
     kfree(ehdr);
     filp_close(file, NULL);
@@ -237,6 +333,14 @@ int do_execve(const char *filename, char *const argv[], char *const envp[]) {
     __asm__ volatile("wrmsr" :: "c"(0xC0000100UL), "a"(0), "d"(0));
 
     switch_to_user(&frame);
+    __builtin_unreachable();
+
+kill_macho:
+    restore_kernel_mm();
+    filp_close(file, NULL);
+    free_strarray(k_argv, argc);
+    free_strarray(k_envp, envc);
+    sys_exit(1);
     __builtin_unreachable();
 
 kill:

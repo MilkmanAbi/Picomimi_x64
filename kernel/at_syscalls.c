@@ -145,6 +145,10 @@ s64 sys_mkdirat(int dirfd, const char *pathname, u32 mode) {
     const char *base = path_basename(pathname);
     qstr_t qname = { .name = (const u8 *)base,
                      .len  = (u32)strlen(base), .hash = 0 };
+
+    dentry_t *existing = d_lookup(parent.dentry, &qname);
+    if (existing) { dput(existing); path_put(&parent); return -EEXIST; }
+
     dentry_t *new_d = d_alloc(parent.dentry, &qname);
     if (!new_d) { path_put(&parent); return -ENOMEM; }
 

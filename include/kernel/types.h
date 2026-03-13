@@ -508,6 +508,20 @@ static inline bool IS_ERR(const void *ptr) { return IS_ERR_VALUE((unsigned long)
 #define VM_HEAP         0x00080000
 #define VM_STACK        0x00100000
 #define VM_FILE         0x00200000
+#define VM_ANON         0x00400000  /* anonymous mapping (no file backing) */
+#define VM_COW          0x00800000  /* page(s) are copy-on-write */
+
+/* poll() event flags */
+#ifndef POLLIN
+#define POLLIN          0x0001
+#define POLLPRI         0x0002
+#define POLLOUT         0x0004
+#define POLLERR         0x0008
+#define POLLHUP         0x0010
+#define POLLNVAL        0x0020
+#define POLLRDNORM      0x0040
+#define POLLWRNORM      POLLOUT
+#endif
 #endif
 
 // ============================================================================

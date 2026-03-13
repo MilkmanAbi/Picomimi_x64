@@ -10,6 +10,13 @@
 #include <lib/printk.h>
 #include <lib/string.h>
 #include <arch/cpu.h>
+#include <kernel/kernel.h>
+
+extern int snprintf(char *buf, size_t size, const char *fmt, ...);
+
+/* Forward declarations */
+void sched_load_balance(void);
+static inline void sched_update_load(void);
 
 // ============================================================================
 // SCHEDULER CONSTANTS
@@ -238,12 +245,7 @@ void sched_enqueue_task(task_struct_t *task) {
 static task_struct_t *pick_next_task(runqueue_t *rq) {
     // Find highest priority with runnable tasks
     int prio = find_first_set_bit(rq->active_bitmap);
-    if (prio < 0) {
-        // Debug: print bitmap state
-        printk(KERN_DEBUG "[sched] active empty: nr=%d expired_bit0=0x%llx\n",
-               rq->nr_running, rq->expired_bitmap[0]);
-    }
-    
+
     if (prio < 0) {
         // No active tasks - swap arrays if expired has tasks
         prio = find_first_set_bit(rq->expired_bitmap);
@@ -390,24 +392,25 @@ void scheduler_tick(void) {
     int cpu = smp_processor_id();
     runqueue_t *rq = &runqueues[cpu];
     task_struct_t *curr = rq->curr;
-    
+
     if (!curr || curr == rq->idle) {
+        /* Idle CPU: try to steal work */
+        sched_load_balance();
         return;
     }
-    
-    // Decrement timeslice
-    if (curr->time_slice > 0) {
+
+    /* Decrement timeslice */
+    if (curr->time_slice > 0)
         curr->time_slice--;
-    }
-    
-    // Update runtime
+
+    /* Update runtime accounting */
     curr->sum_exec_runtime++;
-    
-    // Need reschedule?
-    if (curr->time_slice <= 0) {
-        // Request reschedule
-        // set_tsk_need_resched(curr);
-    }
+
+    /* Periodic load balancing */
+    sched_load_balance();
+
+    /* Update EWMA load averages */
+    sched_update_load();
 }
 
 // ============================================================================
@@ -521,39 +524,259 @@ int sched_set_nice(task_struct_t *task, int nice) {
 // ============================================================================
 // LOAD BALANCING (for SMP)
 // ============================================================================
+// LOAD BALANCING
+// ============================================================================
 
+/* Minimum load difference before we bother migrating (prevents thrashing) */
+#define LB_IMBALANCE_MIN    20
+/* Max tasks to pull in one balance pass (limits latency spike) */
+#define LB_PULL_MAX         4
+/* Balance interval: every 200ms (200 ticks at 1000Hz) */
+#define LB_INTERVAL_TICKS   200
+
+/* Per-CPU tick counter for staggered balance intervals */
+static u64 lb_next_balance[NR_CPUS];
+
+/* -----------------------------------------------------------------------
+ * Double-lock helper: always acquire locks in cpu-index order to prevent
+ * deadlock between two CPUs trying to balance against each other.
+ * ----------------------------------------------------------------------- */
+static void rq_lock_pair(runqueue_t *a, runqueue_t *b) {
+    if (a->cpu < b->cpu) {
+        spin_lock(&a->lock);
+        spin_lock(&b->lock);
+    } else {
+        spin_lock(&b->lock);
+        spin_lock(&a->lock);
+    }
+}
+
+static void rq_unlock_pair(runqueue_t *a, runqueue_t *b) {
+    spin_unlock(&a->lock);
+    spin_unlock(&b->lock);
+}
+
+/* -----------------------------------------------------------------------
+ * task_migrate: atomically move 'task' from src_rq to dst_rq.
+ * Called with BOTH rq locks held.
+ * ----------------------------------------------------------------------- */
+static void task_migrate(task_struct_t *task, runqueue_t *src_rq, runqueue_t *dst_rq) {
+    /* Pull task off source */
+    if (task->on_rq) {
+        int prio = task->prio;
+        prio_queue_t *q = &src_rq->active[prio];
+        list_del(&task->run_list);
+        q->count--;
+        if (q->count == 0)
+            clear_prio_bit(src_rq->active_bitmap, prio);
+        src_rq->nr_running--;
+        src_rq->load -= (MAX_PRIO - prio);
+        task->on_rq = 0;
+    }
+
+    /* Update task's CPU affiliation */
+    task->cpu = dst_rq->cpu;
+
+    /* Push task onto destination's active queue */
+    enqueue_task(dst_rq, task);
+    dst_rq->nr_migrations++;
+    src_rq->nr_migrations++;
+}
+
+/* -----------------------------------------------------------------------
+ * find_migratable: walk src_rq's active array and find a task that:
+ *   - is not currently running (not src_rq->curr)
+ *   - is allowed to run on dst cpu (cpus_allowed bitmask)
+ *   - is not pinned to its current cpu
+ * Returns NULL if nothing suitable found.
+ * ----------------------------------------------------------------------- */
+static task_struct_t *find_migratable(runqueue_t *src_rq, int dst_cpu) {
+    /* Walk priority levels from lowest (best to migrate) to highest */
+    for (int prio = MAX_PRIO - 1; prio >= 0; prio--) {
+        prio_queue_t *q = &src_rq->active[prio];
+        if (q->count == 0) continue;
+
+        task_struct_t *pos;
+        list_for_each_entry(pos, &q->tasks, run_list) {
+            if (pos == src_rq->curr) continue;          /* running — skip */
+            if (pos == src_rq->idle) continue;          /* idle task — skip */
+            if (pos->state != TASK_RUNNING) continue;   /* sleeping — skip */
+            /* Check CPU affinity: bit dst_cpu must be set */
+            if (pos->cpus_allowed &&
+                !(pos->cpus_allowed & (1ULL << (unsigned)dst_cpu)))
+                continue;
+            return pos;
+        }
+    }
+    return NULL;
+}
+
+/* -----------------------------------------------------------------------
+ * find_busiest_queue: return the most loaded online CPU that has more
+ * load than us + LB_IMBALANCE_MIN.  Returns NULL if none qualify.
+ * ----------------------------------------------------------------------- */
 static runqueue_t *find_busiest_queue(int this_cpu) {
     runqueue_t *busiest = NULL;
-    u64 max_load = 0;
-    
+    u64 max_load = runqueues[this_cpu].load + LB_IMBALANCE_MIN;
+
     for (int cpu = 0; cpu < NR_CPUS; cpu++) {
         if (cpu == this_cpu) continue;
-        if (!runqueues[cpu].idle) continue;  // CPU not online
-        
+        if (!runqueues[cpu].idle) continue;      /* CPU not yet online */
+        if (runqueues[cpu].nr_running <= 1) continue; /* only idle — nothing to pull */
+
         if (runqueues[cpu].load > max_load) {
             max_load = runqueues[cpu].load;
             busiest = &runqueues[cpu];
         }
     }
-    
     return busiest;
 }
 
+/* -----------------------------------------------------------------------
+ * sched_load_balance: pull-based load balancing.
+ *
+ * Called from scheduler_tick() on each CPU.  Each CPU tries to pull work
+ * from the busiest CPU if there is a meaningful imbalance.
+ *
+ * We use a staggered interval (per-CPU lb_next_balance) so not every CPU
+ * runs the balance check on the same tick.
+ * ----------------------------------------------------------------------- */
 void sched_load_balance(void) {
+    extern volatile u64 jiffies;
     int this_cpu = smp_processor_id();
     runqueue_t *this_rq = &runqueues[this_cpu];
-    runqueue_t *busiest = find_busiest_queue(this_cpu);
-    
-    if (!busiest) return;
-    
-    // Calculate imbalance
-    u64 imbalance = (busiest->load - this_rq->load) / 2;
-    if (imbalance < (MAX_PRIO - 120)) {
-        return;  // Not enough imbalance
+
+    /* Staggered interval check */
+    if ((s64)(jiffies - lb_next_balance[this_cpu]) < 0)
+        return;
+    /* Schedule next balance pass, staggered by cpu index to avoid thundering herd */
+    lb_next_balance[this_cpu] = jiffies + LB_INTERVAL_TICKS + (u64)this_cpu * 7;
+
+    /* Find the busiest runqueue that has tasks we can steal */
+    runqueue_t *src_rq = find_busiest_queue(this_cpu);
+    if (!src_rq) return;
+
+    int pulled = 0;
+
+    rq_lock_pair(this_rq, src_rq);
+
+    while (pulled < LB_PULL_MAX) {
+        /* Re-check imbalance under lock (things may have changed) */
+        if (src_rq->load <= this_rq->load + LB_IMBALANCE_MIN)
+            break;
+        if (src_rq->nr_running <= 1)
+            break;
+
+        task_struct_t *task = find_migratable(src_rq, this_cpu);
+        if (!task) break;
+
+        task_migrate(task, src_rq, this_rq);
+        pulled++;
     }
-    
-    // TODO: Actually migrate tasks
-    // This requires careful locking and is complex
+
+    rq_unlock_pair(this_rq, src_rq);
+
+    if (pulled > 0) {
+        printk(KERN_DEBUG "[lb] CPU%d pulled %d task(s) from CPU%d "
+               "(load: %llu→%llu vs src %llu)\n",
+               this_cpu, pulled, src_rq->cpu,
+               this_rq->load - pulled * 0 /* approx */, this_rq->load,
+               src_rq->load);
+    }
+}
+
+// ============================================================================
+// ============================================================================
+// PER-CPU ACCESSORS (for /proc/stat, /proc/loadavg, etc.)
+// ============================================================================
+
+/* EWMA load averages — updated every 5 seconds (5000 ticks at 1kHz)
+ * Uses the standard Unix 1/5/15-minute decay constants:
+ *   α_1min  = e^(-5/60)   ≈ 1/2^3  (fixed-point: shift 11)
+ *   α_5min  = e^(-5/300)  ≈ 1/2^6
+ *   α_15min = e^(-5/900)  ≈ 1/2^8
+ *
+ * load_avg is stored as fixed-point (× 2048) to give two decimal places.
+ */
+#define LOAD_FREQ       5000        /* update every 5000 ticks */
+#define FIXED_1         (1 << 11)   /* 2048 */
+
+static u64 load_avg_1  = 0;  /* × FIXED_1 */
+static u64 load_avg_5  = 0;
+static u64 load_avg_15 = 0;
+static u64 load_next_update = 0;
+
+static void update_load_averages(void) {
+    extern volatile u64 jiffies;
+    if ((s64)(jiffies - load_next_update) < 0) return;
+    load_next_update = jiffies + LOAD_FREQ;
+
+    /* Count total running tasks across all online CPUs */
+    u64 nr_active = 0;
+    for (int i = 0; i < NR_CPUS; i++) {
+        if (!runqueues[i].idle) continue;
+        if (runqueues[i].nr_running > 0)
+            nr_active += runqueues[i].nr_running - 1; /* subtract idle */
+    }
+    u64 n = nr_active * FIXED_1;
+
+    /* EWMA: new = old + (n - old) * alpha */
+    /* α ≈ 1 - e^(-5/60) ≈ 1/8  (approximated as shift) */
+    load_avg_1  += (n > load_avg_1)  ? (n - load_avg_1)  >> 3
+                                     : -(((load_avg_1  - n) >> 3));
+    load_avg_5  += (n > load_avg_5)  ? (n - load_avg_5)  >> 6
+                                     : -(((load_avg_5  - n) >> 6));
+    load_avg_15 += (n > load_avg_15) ? (n - load_avg_15) >> 8
+                                     : -(((load_avg_15 - n) >> 8));
+}
+
+/* Called from scheduler_tick to keep averages up to date */
+static inline void sched_update_load(void) {
+    update_load_averages();
+}
+
+u64 sched_get_cpu_nr_running(int cpu) {
+    if (cpu < 0 || cpu >= NR_CPUS || !runqueues[cpu].idle) return 0;
+    return runqueues[cpu].nr_running;
+}
+
+u64 sched_get_cpu_nr_switches(int cpu) {
+    if (cpu < 0 || cpu >= NR_CPUS || !runqueues[cpu].idle) return 0;
+    return runqueues[cpu].nr_switches;
+}
+
+u64 sched_get_cpu_load(int cpu) {
+    if (cpu < 0 || cpu >= NR_CPUS || !runqueues[cpu].idle) return 0;
+    return runqueues[cpu].load;
+}
+
+int sched_get_num_online_cpus(void) {
+    int n = 0;
+    for (int i = 0; i < NR_CPUS; i++)
+        if (runqueues[i].idle) n++;
+    return n ? n : 1;
+}
+
+/* Fill a buffer with "1.23 4.56 7.89 running/total last_pid\n" */
+size_t sched_gen_loadavg(char *buf, size_t size) {
+    update_load_averages();
+    u64 a1  = load_avg_1  / FIXED_1;
+    u64 f1  = (load_avg_1  * 100 / FIXED_1) % 100;
+    u64 a5  = load_avg_5  / FIXED_1;
+    u64 f5  = (load_avg_5  * 100 / FIXED_1) % 100;
+    u64 a15 = load_avg_15 / FIXED_1;
+    u64 f15 = (load_avg_15 * 100 / FIXED_1) % 100;
+
+    u32 running = kernel_state.running_tasks;
+    u32 total   = kernel_state.total_tasks;
+    if (total == 0) total = 1;
+
+    extern task_struct_t *get_current_task(void);
+    task_struct_t *ct = get_current_task();
+    pid_t last = ct ? ct->pid : 1;
+
+    return (size_t)snprintf(buf, size, "%llu.%02llu %llu.%02llu %llu.%02llu %u/%u %d\n",
+                            a1, f1, a5, f5, a15, f15, running, total, (int)last);
 }
 
 // ============================================================================

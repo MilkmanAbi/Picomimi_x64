@@ -138,22 +138,15 @@ static s64 console_read(struct file *file, char *buf, size_t count, u64 *ppos) {
 
     char ch = (char)(c & 0xFF);
 
-    /* CR -> LF (terminal canonical mode) */
+    /* CR -> LF (terminal canonical mode: Enter key sends \r, we give ash \n) */
     if (ch == '\r') ch = '\n';
 
     buf[0] = ch;
 
-    /* Echo: print back to serial so user sees what they typed */
-    if (ch == '\n') {
-        serial_putc(COM1, '\r');
-        serial_putc(COM1, '\n');
-    } else if (ch == 127 || ch == 8) {      /* DEL / backspace */
-        serial_putc(COM1, 8);
-        serial_putc(COM1, ' ');
-        serial_putc(COM1, 8);
-    } else {
-        serial_putc(COM1, ch);
-    }
+    /* NO manual echo here — ash owns echo via termios ECHO flag.
+     * Echoing here AND letting ash echo produces double characters.
+     * The TTY line discipline (ash in this case) will write the char
+     * back to stdout itself when ECHO is set in c_lflag. */
 
     return 1;
 }
@@ -316,6 +309,8 @@ static int devfs_mknod(dentry_t *parent, const char *name, u32 mode, dev_t dev) 
 int init_devfs(void) {
     extern vfsmount_t *root_mnt;
     extern dentry_t *root_dentry;
+    extern const inode_operations_t ramfs_dir_inode_ops;
+    extern const file_operations_t ramfs_dir_ops;
     
     if (!root_mnt || !root_dentry) {
         printk(KERN_ERR "devfs: Root not mounted\n");
@@ -323,30 +318,26 @@ int init_devfs(void) {
     }
     
     printk(KERN_INFO "VFS: Creating /dev...\n");
-    
-    // Create /dev directory
+
+    /* Create /dev directory — check first to avoid duplicate dentry */
     qstr_t devname = { .name = (const unsigned char *)"dev", .len = 3 };
-    dentry_t *dev_dentry = d_alloc(root_dentry, &devname);
+    dentry_t *dev_dentry = d_lookup(root_dentry, &devname);
     if (!dev_dentry) {
-        return -ENOMEM;
+        dev_dentry = d_alloc(root_dentry, &devname);
+        if (!dev_dentry) return -ENOMEM;
+
+        inode_t *dev_inode = new_inode(root_dentry->d_sb);
+        if (!dev_inode) { dput(dev_dentry); return -ENOMEM; }
+
+        dev_inode->i_ino  = 2;
+        dev_inode->i_mode = S_IFDIR | 0755;
+        set_nlink(dev_inode, 2);
+
+        dev_inode->i_op  = &ramfs_dir_inode_ops;
+        dev_inode->i_fop = &ramfs_dir_ops;
+
+        d_instantiate(dev_dentry, dev_inode);
     }
-    
-    inode_t *dev_inode = new_inode(root_dentry->d_sb);
-    if (!dev_inode) {
-        dput(dev_dentry);
-        return -ENOMEM;
-    }
-    
-    dev_inode->i_ino = 2;
-    dev_inode->i_mode = S_IFDIR | 0755;
-    set_nlink(dev_inode, 2);
-    
-    extern const inode_operations_t ramfs_dir_inode_ops;
-    extern const file_operations_t ramfs_dir_ops;
-    dev_inode->i_op = &ramfs_dir_inode_ops;
-    dev_inode->i_fop = &ramfs_dir_ops;
-    
-    d_instantiate(dev_dentry, dev_inode);
     
     // Create device nodes
     devfs_mknod(dev_dentry, "null",    S_IFCHR | 0666, MKDEV(MEM_MAJOR, NULL_MINOR));

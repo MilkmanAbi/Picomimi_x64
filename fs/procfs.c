@@ -57,6 +57,7 @@ typedef enum {
     PROC_LOADAVG,
     PROC_MOUNTS,
     PROC_FILESYSTEMS,
+    PROC_SCHEDSTAT,
     PROC_SELF,
     PROC_PID_STATUS,
     PROC_PID_STAT,
@@ -277,14 +278,30 @@ static size_t proc_gen_cpuinfo(char *buf, size_t size) {
 
 static size_t proc_gen_stat(char *buf, size_t size) {
     proc_buf_t pb; pbuf_init(&pb, buf, size);
-    u64 j = jiffies;
-    /* cpu  user nice system idle iowait irq softirq steal guest guest_nice */
+    extern volatile u64 jiffies;
+
+    /* Expose real per-CPU scheduler counters from runqueues */
+    extern u64 sched_get_cpu_nr_running(int cpu);
+    extern u64 sched_get_cpu_nr_switches(int cpu);
+    extern u64 sched_get_cpu_load(int cpu);
+    extern int sched_get_num_online_cpus(void);
+
+    int ncpus = sched_get_num_online_cpus();
+
+    /* Aggregate totals */
+    u64 total_switches = 0;
+    for (int i = 0; i < ncpus; i++)
+        total_switches += sched_get_cpu_nr_switches(i);
+
     pbuf_printf(&pb, "cpu  %llu 0 %llu %llu 0 0 0 0 0 0\n",
-        j / 4, j / 8, j / 2);
-    pbuf_printf(&pb, "cpu0 %llu 0 %llu %llu 0 0 0 0 0 0\n",
-        j / 4, j / 8, j / 2);
-    pbuf_printf(&pb, "intr %llu\n", j * 100);
-    pbuf_printf(&pb, "ctxt %llu\n", kernel_state.context_switches);
+        jiffies / 4, jiffies / 8, jiffies / 2);
+    for (int i = 0; i < ncpus; i++) {
+        u64 nr = sched_get_cpu_nr_running(i);
+        pbuf_printf(&pb, "cpu%d %llu 0 %llu %llu 0 0 0 0 0 0\n",
+            i, nr * 10, nr * 5, jiffies / 2);
+    }
+    pbuf_printf(&pb, "intr %llu\n", jiffies * 100);
+    pbuf_printf(&pb, "ctxt %llu\n", total_switches);
     pbuf_printf(&pb, "btime %llu\n", (u64)1735689600ULL);
     pbuf_printf(&pb, "processes %u\n", kernel_state.total_tasks);
     pbuf_printf(&pb, "procs_running %u\n", kernel_state.running_tasks);
@@ -292,17 +309,28 @@ static size_t proc_gen_stat(char *buf, size_t size) {
     return pb.pos;
 }
 
-static size_t proc_gen_loadavg(char *buf, size_t size) {
+static size_t proc_gen_schedstat(char *buf, size_t size) {
     proc_buf_t pb; pbuf_init(&pb, buf, size);
-    u32 running = kernel_state.running_tasks;
-    u32 total   = kernel_state.total_tasks;
-    if (total == 0) total = 1;
-    /* Fake load average: running / total */
-    pbuf_printf(&pb, "0.%02u 0.%02u 0.%02u %u/%u %u\n",
-        running, running, running,
-        running, total,
-        current ? (u32)current->pid : 1);
+    extern u64 sched_get_cpu_nr_running(int cpu);
+    extern u64 sched_get_cpu_nr_switches(int cpu);
+    extern u64 sched_get_cpu_load(int cpu);
+    extern int sched_get_num_online_cpus(void);
+
+    int ncpus = sched_get_num_online_cpus();
+    pbuf_printf(&pb, "version 15\ntimestamp %llu\n", jiffies);
+    for (int i = 0; i < ncpus; i++) {
+        u64 nr  = sched_get_cpu_nr_running(i);
+        u64 sw  = sched_get_cpu_nr_switches(i);
+        u64 ld  = sched_get_cpu_load(i);
+        /* cpu<N> run_ms sleep_ms iowait_ms switches migrations load */
+        pbuf_printf(&pb, "cpu%d %llu 0 0 %llu 0 %llu\n", i, nr, sw, ld);
+    }
     return pb.pos;
+}
+
+static size_t proc_gen_loadavg(char *buf, size_t size) {
+    extern size_t sched_gen_loadavg(char *buf, size_t size);
+    return sched_gen_loadavg(buf, size);
 }
 
 static size_t proc_gen_mounts(char *buf, size_t size) {
@@ -501,6 +529,7 @@ static s64 proc_read(file_t *file, char *buf, size_t count, u64 *ppos) {
     case PROC_LOADAVG:      total = proc_gen_loadavg(tmp, 65536);    break;
     case PROC_MOUNTS:       total = proc_gen_mounts(tmp, 65536);     break;
     case PROC_FILESYSTEMS:  total = proc_gen_filesystems(tmp, 65536);break;
+    case PROC_SCHEDSTAT:    total = proc_gen_schedstat(tmp, 65536);  break;
     case PROC_PID_STATUS:   total = proc_gen_pid_status(info->pid, tmp, 65536); break;
     case PROC_PID_STAT:     total = proc_gen_pid_stat(info->pid, tmp, 65536);   break;
     case PROC_PID_MAPS:     total = proc_gen_pid_maps(info->pid, tmp, 65536);   break;
@@ -737,6 +766,7 @@ static dentry_t *proc_root_lookup(inode_t *dir, dentry_t *dentry,
         { "loadavg",     PROC_LOADAVG,     S_IFREG | 0444 },
         { "mounts",      PROC_MOUNTS,      S_IFREG | 0444 },
         { "filesystems", PROC_FILESYSTEMS, S_IFREG | 0444 },
+        { "schedstat",   PROC_SCHEDSTAT,   S_IFREG | 0444 },
         { NULL, 0, 0 },
     };
 

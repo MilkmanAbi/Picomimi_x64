@@ -282,54 +282,65 @@ static s64 ramfs_readdir(struct file *file, void *dirent,
                          int (*filldir)(void *, const char *, int, u64, unsigned int)) {
     dentry_t *dentry = file->f_dentry;
     struct list_head *pos;
-    int i = 0;
-    
-    // . and ..
+
+    /* f_pos encoding:
+     *   0  = not yet emitted '.'
+     *   1  = not yet emitted '..'
+     *   2+ = child index (0-based) + 2, i.e. child 0 → f_pos=2, child 1 → f_pos=3 ...
+     */
+
     if (file->f_pos == 0) {
-        if (filldir(dirent, ".", 1, dentry->d_inode->i_ino, DT_DIR) < 0) {
+        if (filldir(dirent, ".", 1, dentry->d_inode->i_ino, DT_DIR) < 0)
             return 0;
-        }
-        file->f_pos++;
+        file->f_pos = 1;
     }
-    
+
     if (file->f_pos == 1) {
-        u64 parent_ino = dentry->d_parent->d_inode ? 
-                         dentry->d_parent->d_inode->i_ino : 
+        u64 parent_ino = dentry->d_parent && dentry->d_parent->d_inode ?
+                         dentry->d_parent->d_inode->i_ino :
                          dentry->d_inode->i_ino;
-        if (filldir(dirent, "..", 2, parent_ino, DT_DIR) < 0) {
+        if (filldir(dirent, "..", 2, parent_ino, DT_DIR) < 0)
             return 0;
-        }
-        file->f_pos++;
+        file->f_pos = 2;
     }
-    
-    // Children
+
+    /* Walk children; skip any we've already emitted (f_pos > child_index+2) */
+    u64 child_idx = 0;
     list_for_each(pos, &dentry->d_subdirs) {
         dentry_t *child = list_entry(pos, dentry_t, d_child);
-        
-        i++;
-        if (i < (int)file->f_pos - 1) {
+
+        if (child_idx + 2 < (u64)file->f_pos) {
+            /* Already emitted in a previous getdents64 call */
+            child_idx++;
             continue;
         }
-        
+
         if (!child->d_inode) {
-            continue;  // Negative dentry
+            /* Negative dentry — skip but advance position */
+            child_idx++;
+            file->f_pos++;
+            continue;
         }
-        
+
         unsigned int type = DT_UNKNOWN;
-        if (S_ISREG(child->d_inode->i_mode)) type = DT_REG;
-        else if (S_ISDIR(child->d_inode->i_mode)) type = DT_DIR;
-        else if (S_ISLNK(child->d_inode->i_mode)) type = DT_LNK;
-        else if (S_ISCHR(child->d_inode->i_mode)) type = DT_CHR;
-        else if (S_ISBLK(child->d_inode->i_mode)) type = DT_BLK;
-        
+        u32 mode = child->d_inode->i_mode;
+        if      (S_ISREG(mode))  type = DT_REG;
+        else if (S_ISDIR(mode))  type = DT_DIR;
+        else if (S_ISLNK(mode))  type = DT_LNK;
+        else if (S_ISCHR(mode))  type = DT_CHR;
+        else if (S_ISBLK(mode))  type = DT_BLK;
+        else if (S_ISFIFO(mode)) type = DT_FIFO;
+        else if (S_ISSOCK(mode)) type = DT_SOCK;
+
         if (filldir(dirent, (const char *)child->d_name.name, child->d_name.len,
                     child->d_inode->i_ino, type) < 0) {
-            return 0;
+            return 0;   /* Buffer full — caller will call us again with same f_pos */
         }
-        
+
+        child_idx++;
         file->f_pos++;
     }
-    
+
     return 0;
 }
 

@@ -479,31 +479,115 @@ void iounmap(void *addr) {
 // SLAB ALLOCATOR
 // ============================================================================
 
-static u8 heap[64 * 1024 * 1024] __aligned(PAGE_SIZE);  // 64MB heap (supports large FB back-buffers for PaperDE)
-static size_t heap_used = 0;
+/* ============================================================================
+ * Real free-list slab allocator — replaces bump allocator
+ *
+ * Design:
+ *   - 64 MB static heap (same size as before, keeps large FB back-buffers)
+ *   - Every allocation is prefixed by an 8-byte header:
+ *       [size:u32][magic:u32]  (ALLOC_MAGIC or FREE_MAGIC)
+ *   - kfree() marks the header FREE and merges adjacent free blocks
+ *     (first-fit coalesce on free)
+ *   - kmalloc() uses first-fit search in the free list; falls back to bump
+ *     if no free block is large enough
+ *   - Thread safety: simple spinlock (cli/sti pair) — same as rest of kernel
+ * ========================================================================== */
+
+#define SLAB_MAGIC_ALLOC  0xA110CA7EU
+#define SLAB_MAGIC_FREE   0xFEE1DEAD
+
+typedef struct slab_hdr {
+    u32 size;        /* payload bytes (not including this header) */
+    u32 magic;       /* SLAB_MAGIC_ALLOC or SLAB_MAGIC_FREE       */
+} __attribute__((packed)) slab_hdr_t;
+
+#define SLAB_HDR_SZ  sizeof(slab_hdr_t)   /* 8 bytes */
+
+static u8 heap[64 * 1024 * 1024] __aligned(PAGE_SIZE);
+static size_t heap_bump = 0;          /* bump pointer for virgin territory */
+static size_t heap_used = 0;          /* live allocated bytes (approx)     */
+static size_t heap_freed = 0;         /* bytes returned via kfree           */
+
+/* Spinlock: 0=free, 1=held */
+static volatile int slab_lock = 0;
+
+static inline void slab_acquire(void) {
+    while (__sync_lock_test_and_set(&slab_lock, 1)) {
+        __asm__ volatile("pause");
+    }
+}
+static inline void slab_release(void) {
+    __sync_lock_release(&slab_lock);
+}
 
 void slab_init(void) {
+    heap_bump = 0;
     heap_used = 0;
-    printk(KERN_INFO "  Slab allocator initialized (64MB heap)\n");
+    heap_freed = 0;
+    printk(KERN_INFO "  Slab allocator initialized (64MB heap, free-list enabled)\n");
+}
+
+/* Internal: carve a new block from the virgin region. */
+static void *slab_bump(size_t payload) {
+    size_t total = SLAB_HDR_SZ + payload;
+    if (heap_bump + total > sizeof(heap))
+        return NULL;
+    slab_hdr_t *hdr = (slab_hdr_t *)&heap[heap_bump];
+    hdr->size  = (u32)payload;
+    hdr->magic = SLAB_MAGIC_ALLOC;
+    heap_bump += total;
+    heap_used += payload;
+    return (u8 *)hdr + SLAB_HDR_SZ;
 }
 
 void *kmalloc(size_t size, gfp_t flags) {
-    size = ALIGN(size, 16);
-    if (heap_used + size > sizeof(heap)) {
-        printk(KERN_ERR "[kmalloc] OOM: requested %zu, heap_used=%zu/%zu\n",
-               size, heap_used, sizeof(heap));
+    if (!size) return NULL;
+    size = ALIGN(size, 16);          /* 16-byte alignment */
+
+    slab_acquire();
+
+    /* First-fit search through the already-bumped region for a free block. */
+    if (heap_freed > 0) {
+        size_t off = 0;
+        while (off + SLAB_HDR_SZ <= heap_bump) {
+            slab_hdr_t *hdr = (slab_hdr_t *)&heap[off];
+            if (hdr->magic == SLAB_MAGIC_FREE && hdr->size >= size) {
+                /* Found a big enough free block. */
+                if (hdr->size >= size + SLAB_HDR_SZ + 16) {
+                    /* Split: carve off what we need; leave the remainder free. */
+                    size_t leftover = hdr->size - size - SLAB_HDR_SZ;
+                    slab_hdr_t *tail = (slab_hdr_t *)((u8 *)hdr + SLAB_HDR_SZ + size);
+                    tail->size  = (u32)leftover;
+                    tail->magic = SLAB_MAGIC_FREE;
+                    hdr->size   = (u32)size;
+                } else {
+                    heap_freed -= hdr->size;   /* entire block consumed */
+                }
+                hdr->magic  = SLAB_MAGIC_ALLOC;
+                heap_used  += hdr->size;
+                void *ptr   = (u8 *)hdr + SLAB_HDR_SZ;
+                slab_release();
+                if (flags & __GFP_ZERO) __builtin_memset(ptr, 0, size);
+                return ptr;
+            }
+            off += SLAB_HDR_SZ + hdr->size;
+        }
+    }
+
+    /* No suitable free block — bump-allocate from virgin region. */
+    void *ptr = slab_bump(size);
+    slab_release();
+
+    if (!ptr) {
+        printk(KERN_ERR "[kmalloc] OOM: size=%zu bump=%zu/%zu freed=%zu\n",
+               size, heap_bump, sizeof(heap), heap_freed);
         return NULL;
     }
-    void *ptr = &heap[heap_used];
-    heap_used += size;
-    
-    if (flags & __GFP_ZERO) {
-        __builtin_memset(ptr, 0, size);
-    }
+    if (flags & __GFP_ZERO) __builtin_memset(ptr, 0, size);
     return ptr;
 }
 
-size_t kmalloc_used(void) { return heap_used; }
+size_t kmalloc_used(void)  { return heap_used;  }
 size_t kmalloc_total(void) { return sizeof(heap); }
 
 void *kzalloc(size_t size, gfp_t flags) {
@@ -511,8 +595,41 @@ void *kzalloc(size_t size, gfp_t flags) {
 }
 
 void kfree(void *ptr) {
-    // Simple bump allocator - no free support yet
-    (void)ptr;
+    if (!ptr) return;
+
+    slab_hdr_t *hdr = (slab_hdr_t *)((u8 *)ptr - SLAB_HDR_SZ);
+
+    /* Sanity check — catch double-free and bogus pointers. */
+    if (hdr->magic == SLAB_MAGIC_FREE) {
+        printk(KERN_WARNING "[kfree] double-free at %p (caller=%p) size=%u\n",
+               ptr, __builtin_return_address(0), hdr->size);
+        return;
+    }
+    if (hdr->magic != SLAB_MAGIC_ALLOC) {
+        printk(KERN_WARNING "[kfree] corrupt header at %p (magic=0x%x)\n",
+               ptr, hdr->magic);
+        return;
+    }
+
+    slab_acquire();
+
+    size_t payload = hdr->size;
+    hdr->magic     = SLAB_MAGIC_FREE;
+    heap_used     -= payload;
+    heap_freed    += payload;
+
+    /* Forward-coalesce: merge with the next free block if adjacent. */
+    size_t off = (size_t)((u8 *)hdr - heap);
+    size_t next_off = off + SLAB_HDR_SZ + hdr->size;
+    if (next_off + SLAB_HDR_SZ <= heap_bump) {
+        slab_hdr_t *next = (slab_hdr_t *)&heap[next_off];
+        if (next->magic == SLAB_MAGIC_FREE) {
+            hdr->size  += SLAB_HDR_SZ + next->size;
+            heap_freed -= SLAB_HDR_SZ; /* the merged header is recovered */
+        }
+    }
+
+    slab_release();
 }
 
 // ============================================================================

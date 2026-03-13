@@ -28,6 +28,7 @@
 #include <mm/slab.h>
 #include <lib/printk.h>
 #include <lib/string.h>
+#include <arch/cpu.h>
 
 extern void vmm_map_page(u64 virt, u64 phys, u64 flags);
 
@@ -408,4 +409,48 @@ s64 sys_mprotect(void *addr, size_t len, int prot) {
     }
 
     return 0;
+}
+
+/* ============================================================
+ * vmm_get_phys — walk page tables to get physical addr for VA.
+ * Returns 0 if not mapped.
+ * ============================================================ */
+phys_addr_t vmm_get_phys(virt_addr_t virt) {
+#define KERN_OFF 0xFFFFFFFF80000000ULL
+    u64 *pml4 = (u64 *)(read_cr3() + KERN_OFF);
+    int l4 = (int)((virt >> 39) & 0x1FF);
+    int l3 = (int)((virt >> 30) & 0x1FF);
+    int l2 = (int)((virt >> 21) & 0x1FF);
+    int l1 = (int)((virt >> 12) & 0x1FF);
+
+    if (!(pml4[l4] & PTE_PRESENT)) return 0;
+    u64 *pdpt = (u64 *)((pml4[l4] & ~0xFFFULL) + KERN_OFF);
+    if (!(pdpt[l3] & PTE_PRESENT)) return 0;
+    if (pdpt[l3] & PTE_HUGE)
+        return (pdpt[l3] & ~0x3FFFFFFFULL) | (virt & 0x3FFFFFFF);
+    u64 *pd = (u64 *)((pdpt[l3] & ~0xFFFULL) + KERN_OFF);
+    if (!(pd[l2] & PTE_PRESENT)) return 0;
+    if (pd[l2] & PTE_HUGE)
+        return (pd[l2] & ~0x1FFFFFULL) | (virt & 0x1FFFFF);
+    u64 *pt = (u64 *)((pd[l2] & ~0xFFFULL) + KERN_OFF);
+    if (!(pt[l1] & PTE_PRESENT)) return 0;
+    return (pt[l1] & ~0xFFFULL) | (virt & 0xFFF);
+#undef KERN_OFF
+}
+
+/* ============================================================
+ * find_vma — find the VMA containing addr (or next VMA after it).
+ * ============================================================ */
+vm_area_t *find_vma(mm_struct_t *mm, u64 addr) {
+    if (!mm) return NULL;
+    vm_area_t *best = NULL;
+    for (vm_area_t *v = mm->mmap; v; v = v->next) {
+        if (addr >= v->start && addr < v->end)
+            return v;
+        if (v->start > addr) {
+            if (!best || v->start < best->start)
+                best = v;
+        }
+    }
+    return best;
 }

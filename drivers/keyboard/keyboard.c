@@ -229,8 +229,12 @@ void kbd_handle_irq(void) {
 
     /* Enqueue */
     eq_push(&ev);
-    if (ev.pressed && ev.ascii)
+    if (ev.pressed && ev.ascii) {
         cq_push(ev.ascii);
+        /* Feed character into TTY line discipline so userspace read() works */
+        extern void tty_keyboard_input(u8 c);
+        tty_keyboard_input((u8)ev.ascii);
+    }
 
     /* Also push to /dev/input/event0 for PaperDE / userspace */
     input_push_key((u16)kc, !released);

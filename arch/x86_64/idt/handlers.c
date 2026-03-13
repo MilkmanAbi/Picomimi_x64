@@ -154,35 +154,64 @@ void exception_handler(regs_t *regs) {
                regs->cs, regs->ss, regs->rflags);
         
         if (vector == 14) {
-            // Page fault - show CR2
+            /* ============================================================
+             * #PF handler — demand paging + Copy-on-Write
+             *
+             * Error code bits:
+             *   bit 0 (P):  0=not-present  1=protection violation
+             *   bit 1 (W):  0=read         1=write
+             *   bit 2 (U):  0=supervisor   1=user
+             *   bit 4 (I):  instruction fetch
+             * ============================================================ */
             u64 cr2;
             __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-            printk(KERN_EMERG "CR2 (fault address): 0x%lx\n", cr2);
-            printk(KERN_EMERG "Page fault flags: %s%s%s%s\n",
-                   (regs->error_code & 1) ? "P " : "NP ",
-                   (regs->error_code & 2) ? "W " : "R ",
-                   (regs->error_code & 4) ? "U " : "S ",
-                   (regs->error_code & 16) ? "I" : "D");
 
-            /* User-space fault (#PF with U bit): send SIGSEGV and reschedule
-             * instead of halting the entire system */
-            if (regs->error_code & 4) {
-                printk(KERN_ERR "Killing user process (SIGSEGV) RIP=0x%lx err=0x%lx CR2=0x%llx\n", regs->rip, regs->error_code, cr2);
-                /* If RIP=0 (NULL call), print the return address from user stack */
-                if (regs->rip == 0 && regs->rsp >= 0x400000 && regs->rsp < 0x800000000000ULL) {
+            int fault_present = (regs->error_code & 1);
+            int fault_write   = (regs->error_code & 2);
+            int fault_user    = (regs->error_code & 4);
+
+            /* Ask the kernel memory subsystem to handle it */
+            extern int do_page_fault(u64 fault_addr, int present,
+                                     int write, int user);
+            int handled = do_page_fault(cr2, fault_present, fault_write, fault_user);
+
+            if (handled == 0)
+                return;  /* Fault resolved — resume faulting instruction */
+
+            /* Unhandled fault */
+            if (fault_user) {
+                /* User-space SIGSEGV */
+                printk(KERN_ERR
+                    "[#PF] user SIGSEGV: CR2=0x%llx RIP=0x%lx err=0x%lx\n",
+                    cr2, regs->rip, regs->error_code);
+                if (regs->rip == 0 && regs->rsp >= 0x400000ULL &&
+                    regs->rsp < 0x800000000000ULL) {
                     u64 *usp = (u64 *)regs->rsp;
-                    printk(KERN_ERR "  [caller at RSP+0]=0x%llx RSP+8=0x%llx RSP+16=0x%llx\n",
+                    printk(KERN_ERR "  RSP[0..2]: 0x%llx 0x%llx 0x%llx\n",
                            usp[0], usp[1], usp[2]);
-
                 }
                 extern void do_exit(int code);
                 extern void schedule(void);
-                do_exit(11);
+                do_exit(11);  /* SIGSEGV */
                 schedule();
                 return;
+            } else {
+                /* Kernel oops */
+                printk(KERN_EMERG
+                    "[#PF] KERNEL OOPS: CR2=0x%llx RIP=0x%lx err=0x%lx\n",
+                    cr2, regs->rip, regs->error_code);
+                printk(KERN_EMERG "Page fault flags: %s%s%s%s\n",
+                       fault_present ? "P " : "NP ",
+                       fault_write   ? "W " : "R ",
+                       fault_user    ? "U " : "S ",
+                       (regs->error_code & 16) ? "I" : "D");
+                printk(KERN_EMERG "System halted.\n");
+                __asm__ volatile("cli");
+                for (;;) { __asm__ volatile("hlt"); }
             }
         }
-        
+
+
         // Halt on unrecoverable kernel exceptions
         if (vector == 8 || vector == 13 || vector == 14) {
             printk(KERN_EMERG "\nSystem halted.\n");
@@ -220,6 +249,13 @@ void timer_handler(regs_t *regs) {
     /* Drive the O(1) scheduler on each tick */
     extern void scheduler_tick(void);
     scheduler_tick();
+
+    /* Poll e1000 RX every 10 ticks (~10ms) to drain received packets */
+    if ((system_ticks % 10) == 0) {
+        extern void e1000_rx_poll(void);
+        e1000_rx_poll();
+    }
+
     /* Preempt if current task timeslice expired or a higher-prio task is ready */
     extern void schedule(void);
     schedule();

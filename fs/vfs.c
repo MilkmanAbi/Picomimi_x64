@@ -247,7 +247,11 @@ dentry_t *d_alloc(dentry_t *parent, const qstr_t *name) {
     
     if (parent) {
         dentry->d_sb = parent->d_sb;
-        list_add(&dentry->d_child, &parent->d_subdirs);
+        /* Guard against double-insertion (list corruption) */
+        if (dentry->d_child.next == &dentry->d_child &&
+            dentry->d_child.prev == &dentry->d_child) {
+            list_add(&dentry->d_child, &parent->d_subdirs);
+        }
     }
     
     spin_lock(&dcache_lock);

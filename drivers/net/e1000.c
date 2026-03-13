@@ -10,6 +10,7 @@
 #include <lib/string.h>
 #include <mm/slab.h>
 #include <arch/io.h>
+#include <net/socket.h>    /* net_device_t, sk_buff_t, skb_alloc/free/put */
 
 // ============================================================================
 // E1000 REGISTERS
@@ -188,7 +189,11 @@ typedef struct e1000_device {
     u64             tx_bytes;
     
     struct e1000_device *next;
+    net_device_t        *ndev;   /* back-pointer for RX poll → eth_receive */
 } e1000_device_t;
+
+/* forward declaration — defined in TX/RX helpers section below */
+static int e1000_net_transmit(net_device_t *ndev, sk_buff_t *skb);
 
 static e1000_device_t *e1000_devices = NULL;
 
@@ -380,6 +385,90 @@ static void __attribute__((unused)) e1000_link_up(e1000_device_t *dev) {
 }
 
 // ============================================================================
+// TX / RX HELPERS (used by net_core glue)
+// ============================================================================
+
+/* Forward declaration: ndev field added to e1000_device_t below.
+ * We store a back-pointer so the timer poll can pass it to eth_receive. */
+
+/**
+ * e1000_net_transmit — called by net_core to send a packet.
+ * Copies skb data into the next free TX descriptor and rings the tail.
+ */
+static int e1000_net_transmit(net_device_t *ndev, sk_buff_t *skb) {
+    e1000_device_t *dev = (e1000_device_t *)ndev->priv;
+    if (!dev || !dev->tx_descs) return -1;
+
+    /* Wait for current descriptor to be free (DD bit set by hardware) */
+    int timeout = 10000;
+    while (!(dev->tx_descs[dev->tx_cur].sta & E1000_TXD_STAT_DD)) {
+        if (--timeout <= 0) {
+            printk(KERN_WARNING "e1000: TX timeout\n");
+            return -1;
+        }
+        __asm__ volatile("pause");
+    }
+
+    /* Copy packet into TX buffer */
+    size_t len = skb->len;
+    if (len > E1000_RX_BUFFER_SIZE) len = E1000_RX_BUFFER_SIZE;
+    memcpy(dev->tx_buffers[dev->tx_cur], skb->data, len);
+
+    /* Fill descriptor */
+    dev->tx_descs[dev->tx_cur].length = (u16)len;
+    dev->tx_descs[dev->tx_cur].cmd    = (u8)(0x0B);  /* EOP | IFCS | RS */
+    dev->tx_descs[dev->tx_cur].sta    = 0;
+
+    /* Advance tail */
+    u32 old = dev->tx_cur;
+    dev->tx_cur = (dev->tx_cur + 1) % E1000_NUM_TX_DESC;
+    (void)old;
+    e1000_write32(dev, E1000_TDT, (u32)dev->tx_cur);
+    return 0;
+}
+
+/**
+ * e1000_rx_poll — drain all pending RX descriptors and dispatch via eth_receive.
+ * Called from the timer tick path (net_poll) once per tick.
+ */
+void e1000_rx_poll(void) {
+    extern void eth_receive(net_device_t *dev, sk_buff_t *skb);
+    for (e1000_device_t *dev = e1000_devices; dev; dev = dev->next) {
+        if (!dev->rx_descs || !dev->ndev) continue;
+
+        for (int budget = 32; budget > 0; budget--) {
+            e1000_rx_desc_t *desc = &dev->rx_descs[dev->rx_cur];
+
+            /* DD (descriptor done) bit indicates hardware wrote a packet */
+            if (!(desc->status & 0x01)) break;
+
+            u16 pkt_len = desc->length;
+            if (pkt_len > 4) pkt_len -= 4; /* strip CRC */
+
+            if (pkt_len > 0 && pkt_len <= (u16)E1000_RX_BUFFER_SIZE) {
+                sk_buff_t *skb = skb_alloc((u32)pkt_len + 64);
+                if (skb) {
+                    u8 *data = skb_put(skb, (u32)pkt_len);
+                    if (data)
+                        memcpy(data, dev->rx_buffers[dev->rx_cur], pkt_len);
+                    eth_receive(dev->ndev, skb);
+                    skb_free(skb);
+                }
+            }
+
+            /* Reset descriptor for re-use */
+            desc->status = 0;
+            desc->length = 0;
+
+            /* Advance head and bump tail to give descriptor back to hardware */
+            u32 old_cur = (u32)dev->rx_cur;
+            dev->rx_cur = (dev->rx_cur + 1) % E1000_NUM_RX_DESC;
+            e1000_write32(dev, E1000_RDT, old_cur);
+        }
+    }
+}
+
+// ============================================================================
 // PCI DRIVER
 // ============================================================================
 
@@ -441,9 +530,30 @@ static int e1000_probe(pci_device_t *pci_dev, const pci_device_id_t *id) {
     // Add to device list
     dev->next = e1000_devices;
     e1000_devices = dev;
-    
+
+    /* ---- Wire up as a net_device so net_core can TX/RX through us ---- */
+    extern void netdev_register(net_device_t *ndev);
+    net_device_t *ndev = kmalloc(sizeof(net_device_t), GFP_KERNEL);
+    if (ndev) {
+        memset(ndev, 0, sizeof(*ndev));
+        /* Interface name: eth0, eth1, ... */
+        static int eth_idx = 0;
+        ndev->name[0] = 'e'; ndev->name[1] = 't'; ndev->name[2] = 'h';
+        ndev->name[3] = (char)('0' + eth_idx++);
+        ndev->name[4] = '\0';
+        memcpy(ndev->mac, dev->mac_addr, 6);
+        ndev->ip4     = 0;  /* will be set by DHCP / ifconfig */
+        ndev->mtu     = 1500;
+        ndev->up      = true;
+        ndev->priv    = dev;
+        ndev->transmit = e1000_net_transmit;
+        netdev_register(ndev);
+        dev->ndev = ndev;
+        printk(KERN_INFO "e1000: registered as %s\n", ndev->name);
+    }
+
     printk(KERN_INFO "e1000: Device initialized successfully\n");
-    
+
     return 0;
 }
 

@@ -44,11 +44,15 @@ C_SOURCES := \
     kernel/mmap.c \
     kernel/fs_syscalls.c \
     kernel/at_syscalls.c \
+    kernel/page_fault.c \
     kernel/shell.c \
     kernel/sysctl.c \
     kernel/cred.c \
     init/init.c \
     kernel/ramfs_populate.c \
+    kernel/macho_loader.c \
+    kernel/xnu_bsd.c \
+    kernel/xnu_mach.c \
     arch/x86_64/idt/handlers.c \
     drivers/serial/serial.c \
     drivers/vga/vga.c \
@@ -161,6 +165,7 @@ dirs:
 	@mkdir -p $(OBJDIR)/mm
 	@mkdir -p $(OBJDIR)/sched
 	@mkdir -p $(OBJDIR)/net
+	@mkdir -p $(OBJDIR)/init
 
 # Compile assembly
 $(OBJDIR)/%.o: %.S | dirs

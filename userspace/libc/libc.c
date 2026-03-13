@@ -416,3 +416,383 @@ int toupper(int c) { return (c>='a'&&c<='z') ? c-32 : c; }
 
 /* abs */
 int abs(int x) { return x < 0 ? -x : x; }
+
+/* ------------------------------------------------------------------ */
+/* Directory API (POSIX opendir/readdir/closedir)                       */
+/* ------------------------------------------------------------------ */
+
+#define DT_UNKNOWN  0
+#define DT_FIFO     1
+#define DT_CHR      2
+#define DT_DIR      4
+#define DT_BLK      6
+#define DT_REG      8
+#define DT_LNK     10
+#define DT_SOCK    12
+
+typedef struct {
+    unsigned long  d_ino;
+    long           d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[256];
+} dirent_t;
+typedef dirent_t Dirent;
+
+typedef struct {
+    int   fd;
+    char  buf[4096];
+    int   buf_pos;
+    int   buf_len;
+} DIR;
+
+DIR *opendir(const char *path) {
+    int fd = open(path, 0 /* O_RDONLY */, 0);
+    if (fd < 0) return NULL;
+    DIR *d = malloc(sizeof(DIR));
+    if (!d) { close(fd); return NULL; }
+    d->fd      = fd;
+    d->buf_pos = 0;
+    d->buf_len = 0;
+    return d;
+}
+
+struct __kernel_dirent64 {
+    unsigned long long d_ino;
+    long long          d_off;
+    unsigned short     d_reclen;
+    unsigned char      d_type;
+    char               d_name[];
+};
+
+dirent_t *readdir(DIR *d) {
+    static dirent_t ent;
+    if (!d) return NULL;
+
+    /* Refill buffer if empty */
+    if (d->buf_pos >= d->buf_len) {
+        long n = __syscall3(SYS_getdents64, (long)d->fd,
+                            (long)d->buf, (long)sizeof(d->buf));
+        if (n <= 0) return NULL;
+        d->buf_len = (int)n;
+        d->buf_pos = 0;
+    }
+
+    struct __kernel_dirent64 *kd =
+        (struct __kernel_dirent64 *)(d->buf + d->buf_pos);
+    d->buf_pos += kd->d_reclen;
+
+    ent.d_ino    = (unsigned long)kd->d_ino;
+    ent.d_off    = (long)kd->d_off;
+    ent.d_reclen = kd->d_reclen;
+    ent.d_type   = kd->d_type;
+    /* d_name is right after the fixed fields */
+    strncpy(ent.d_name, kd->d_name, 255);
+    ent.d_name[255] = '\0';
+    return &ent;
+}
+
+int closedir(DIR *d) {
+    if (!d) return -1;
+    int r = close(d->fd);
+    free(d);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* stat / fstat                                                          */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    unsigned long  st_dev;
+    unsigned long  st_ino;
+    unsigned long  st_nlink;
+    unsigned int   st_mode;
+    unsigned int   st_uid;
+    unsigned int   st_gid;
+    unsigned int   __pad0;
+    unsigned long  st_rdev;
+    long           st_size;
+    long           st_blksize;
+    long           st_blocks;
+    long           st_atim_sec;
+    long           st_atim_nsec;
+    long           st_mtim_sec;
+    long           st_mtim_nsec;
+    long           st_ctim_sec;
+    long           st_ctim_nsec;
+    long           __unused[3];
+} stat_t;
+
+int stat(const char *path, stat_t *buf) {
+    return (int)__syscall2(4 /* SYS_stat */, (long)path, (long)buf);
+}
+int lstat(const char *path, stat_t *buf) {
+    return (int)__syscall2(6 /* SYS_lstat */, (long)path, (long)buf);
+}
+int fstat(int fd, stat_t *buf) {
+    return (int)__syscall2(5 /* SYS_fstat */, (long)fd, (long)buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* Stdio: sprintf / fprintf / fwrite / fflush stubs                     */
+/* ------------------------------------------------------------------ */
+
+/* Very small sprintf (no floats) */
+static int _fmt_num(char *out, size_t left, unsigned long v, int base,
+                    int pad, char padch) {
+    char tmp[22];
+    const char *digs = "0123456789abcdef";
+    int n = 0;
+    if (v == 0) { tmp[n++] = '0'; }
+    else { while (v) { tmp[n++] = digs[v % (unsigned)base]; v /= (unsigned)base; } }
+    /* reverse */
+    for (int i=0,j=n-1; i<j; i++,j--) {
+        char t=tmp[i]; tmp[i]=tmp[j]; tmp[j]=t;
+    }
+    int written = 0;
+    while (pad > n && left > 1) { *out++ = padch; left--; written++; pad--; }
+    for (int i = 0; i < n && left > 1; i++, left--) { *out++ = tmp[i]; written++; }
+    return written;
+}
+
+int vsnprintf(char *buf, size_t sz, const char *fmt, __builtin_va_list ap) {
+    char *p = buf;
+    size_t left = sz;
+    while (*fmt && left > 1) {
+        if (*fmt != '%') { *p++ = *fmt++; left--; continue; }
+        fmt++; /* skip % */
+        char padch = ' ';
+        int  padw  = 0;
+        if (*fmt == '0') { padch = '0'; fmt++; }
+        while (*fmt >= '0' && *fmt <= '9') { padw = padw*10 + (*fmt++ - '0'); }
+        int lng = 0;
+        if (*fmt == 'l') { lng++; fmt++; }
+        if (*fmt == 'l') { lng++; fmt++; }
+        char conv = *fmt++;
+        int w = 0;
+        switch (conv) {
+        case 'd': case 'i': {
+            long v = lng ? __builtin_va_arg(ap, long) : (long)__builtin_va_arg(ap, int);
+            if (v < 0 && left > 1) { *p++ = '-'; left--; v = -v; }
+            w = _fmt_num(p, left, (unsigned long)v, 10, padw, padch);
+            p += w; left -= (size_t)w; break; }
+        case 'u': {
+            unsigned long v = lng ? __builtin_va_arg(ap, unsigned long)
+                                  : (unsigned long)__builtin_va_arg(ap, unsigned int);
+            w = _fmt_num(p, left, v, 10, padw, padch);
+            p += w; left -= (size_t)w; break; }
+        case 'x': case 'X': {
+            unsigned long v = lng ? __builtin_va_arg(ap, unsigned long)
+                                  : (unsigned long)__builtin_va_arg(ap, unsigned int);
+            w = _fmt_num(p, left, v, 16, padw, padch);
+            p += w; left -= (size_t)w; break; }
+        case 'p': {
+            unsigned long v = (unsigned long)__builtin_va_arg(ap, void *);
+            if (left > 2) { *p++ = '0'; *p++ = 'x'; left -= 2; }
+            w = _fmt_num(p, left, v, 16, padw, padch);
+            p += w; left -= (size_t)w; break; }
+        case 's': {
+            const char *s = __builtin_va_arg(ap, const char *);
+            if (!s) s = "(null)";
+            while (*s && left > 1) { *p++ = *s++; left--; }
+            break; }
+        case 'c': {
+            int c = __builtin_va_arg(ap, int);
+            if (left > 1) { *p++ = (char)c; left--; } break; }
+        case '%':
+            if (left > 1) { *p++ = '%'; left--; } break;
+        default:
+            if (left > 1) { *p++ = conv; left--; } break;
+        }
+    }
+    if (sz > 0) *p = '\0';
+    return (int)(p - buf);
+}
+
+int snprintf(char *buf, size_t sz, const char *fmt, ...) {
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int r = vsnprintf(buf, sz, fmt, ap);
+    __builtin_va_end(ap);
+    return r;
+}
+
+int sprintf(char *buf, const char *fmt, ...) {
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int r = vsnprintf(buf, 65536, fmt, ap);
+    __builtin_va_end(ap);
+    return r;
+}
+
+/* FILE* stdio stubs — enough for fprintf(stderr,...) patterns */
+typedef struct { int fd; } FILE;
+static FILE _stdin_f  = {0};
+static FILE _stdout_f = {1};
+static FILE _stderr_f = {2};
+FILE *stdin  = &_stdin_f;
+FILE *stdout = &_stdout_f;
+FILE *stderr = &_stderr_f;
+
+int fprintf(FILE *f, const char *fmt, ...) {
+    char buf[1024];
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    __builtin_va_end(ap);
+    write(f->fd, buf, (size_t)n);
+    return n;
+}
+
+int fputs(const char *s, FILE *f) {
+    size_t n = strlen(s);
+    write(f->fd, s, n);
+    return (int)n;
+}
+
+int fputc(int c, FILE *f) {
+    char ch = (char)c;
+    write(f->fd, &ch, 1);
+    return c;
+}
+
+int fflush(FILE *f) { (void)f; return 0; }
+
+/* ------------------------------------------------------------------ */
+/* String extras                                                         */
+/* ------------------------------------------------------------------ */
+
+char *strtok_r(char *s, const char *delim, char **saveptr) {
+    if (s) *saveptr = s;
+    char *p = *saveptr;
+    if (!p || !*p) return NULL;
+    /* skip leading delimiters */
+    while (*p && strchr(delim, *p)) p++;
+    if (!*p) { *saveptr = p; return NULL; }
+    char *start = p;
+    while (*p && !strchr(delim, *p)) p++;
+    if (*p) { *p++ = '\0'; }
+    *saveptr = p;
+    return start;
+}
+
+char *strtok(char *s, const char *delim) {
+    static char *save;
+    return strtok_r(s, delim, &save);
+}
+
+long strtol(const char *s, char **endp, int base) {
+    while (*s == ' ') s++;
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
+    if (base == 0) {
+        if (*s == '0' && (*(s+1)=='x'||*(s+1)=='X')) { base=16; s+=2; }
+        else if (*s == '0') { base=8; s++; }
+        else base=10;
+    } else if (base == 16 && *s=='0' && (*(s+1)=='x'||*(s+1)=='X')) s+=2;
+    long v = 0;
+    while (*s) {
+        int d;
+        if (*s>='0'&&*s<='9') d=*s-'0';
+        else if (*s>='a'&&*s<='f') d=*s-'a'+10;
+        else if (*s>='A'&&*s<='F') d=*s-'A'+10;
+        else break;
+        if (d >= base) break;
+        v = v*base + d;
+        s++;
+    }
+    if (endp) *endp = (char *)s;
+    return neg ? -v : v;
+}
+
+unsigned long strtoul(const char *s, char **endp, int base) {
+    return (unsigned long)strtol(s, endp, base);
+}
+
+/* ------------------------------------------------------------------ */
+/* Signal                                                                */
+/* ------------------------------------------------------------------ */
+
+#define SIG_DFL ((void(*)(int))0)
+#define SIG_IGN ((void(*)(int))1)
+
+typedef void (*sighandler_t)(int);
+
+struct sigaction_u {
+    sighandler_t sa_handler;
+    unsigned long sa_flags;
+    void (*sa_restorer)(void);
+    unsigned long sa_mask[2];
+};
+
+sighandler_t signal(int sig, sighandler_t handler) {
+    struct sigaction_u act, old;
+    act.sa_handler  = handler;
+    act.sa_flags    = 0x04000000; /* SA_RESTORER */
+    act.sa_restorer = NULL;
+    act.sa_mask[0]  = 0;
+    act.sa_mask[1]  = 0;
+    __syscall4(13 /* SYS_rt_sigaction */, (long)sig,
+               (long)&act, (long)&old, (long)8);
+    return old.sa_handler;
+}
+
+/* ------------------------------------------------------------------ */
+/* sleep / usleep                                                         */
+/* ------------------------------------------------------------------ */
+
+struct timespec_u { long tv_sec; long tv_nsec; };
+
+int sleep(unsigned int secs) {
+    struct timespec_u ts = { (long)secs, 0 };
+    __syscall2(SYS_nanosleep, (long)&ts, 0);
+    return 0;
+}
+
+int usleep(unsigned long us) {
+    struct timespec_u ts = { (long)(us/1000000), (long)((us%1000000)*1000) };
+    __syscall2(SYS_nanosleep, (long)&ts, 0);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* setjmp / longjmp (minimal)                                            */
+/* ------------------------------------------------------------------ */
+
+typedef unsigned long jmp_buf[8];
+
+int __attribute__((returns_twice)) setjmp(jmp_buf env) {
+    __asm__ volatile(
+        "mov %%rbx, 0(%0)\n"
+        "mov %%r12, 8(%0)\n"
+        "mov %%r13,16(%0)\n"
+        "mov %%r14,24(%0)\n"
+        "mov %%r15,32(%0)\n"
+        "mov %%rbp,40(%0)\n"
+        "lea 1f(%%rip),%%rax\n"
+        "mov %%rax, 48(%0)\n"
+        "mov %%rsp, 56(%0)\n"
+        "xor %%eax, %%eax\n"
+        "1:\n"
+        : : "r"(env) : "rax","memory");
+    return 0;  /* compiler will handle the return_twice attribute */
+}
+
+__attribute__((noreturn)) void longjmp(jmp_buf env, int val) {
+    if (val == 0) val = 1;
+    __asm__ volatile(
+        "mov 0(%0), %%rbx\n"
+        "mov 8(%0), %%r12\n"
+        "mov 16(%0), %%r13\n"
+        "mov 24(%0), %%r14\n"
+        "mov 32(%0), %%r15\n"
+        "mov 40(%0), %%rbp\n"
+        "mov 56(%0), %%rsp\n"
+        "mov 48(%0), %%rcx\n"
+        "mov %1, %%eax\n"
+        "jmp *%%rcx\n"
+        : : "r"(env), "r"(val) : "rax","rbx","rcx","r12","r13","r14","r15","rbp","rsp");
+    __builtin_unreachable();
+}
+

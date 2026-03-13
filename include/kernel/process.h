@@ -480,7 +480,13 @@ typedef struct task_struct {
     u64                 acct_rss_mem1;
     u64                 acct_vm_mem1;
     u64                 acct_timexpd;
-    
+
+    // ---- XNU/Darwin compatibility (additive — zero = Linux default) ----
+    u8                  personality;        // PERSONALITY_LINUX=0, PERSONALITY_XNU=1
+    u32                 mach_task_port;     // Mach port name for task-self (XNU tasks)
+    u32                 mach_thread_port;   // Mach port name for thread-self
+    void               *mach_ports;        // mach_port_slot_t[MACH_PORT_MAX_SLOTS] or NULL
+
 } task_struct_t;
 
 // Task flags
