@@ -1,0 +1,863 @@
+/**
+ * Picomimi-x64 O(1) Scheduler
+ * 
+ * Based on Picomimi-AxisOS priority bitmap scheduler
+ * Ported to x86_64 with SMP support
+ */
+
+#include <kernel/types.h>
+#include <kernel/process.h>
+#include <lib/printk.h>
+#include <lib/string.h>
+#include <arch/cpu.h>
+#include <kernel/kernel.h>
+
+extern int snprintf(char *buf, size_t size, const char *fmt, ...);
+
+/* Forward declarations */
+void sched_load_balance(void);
+static inline void sched_update_load(void);
+
+// ============================================================================
+// SCHEDULER CONSTANTS
+// ============================================================================
+
+#define SCHED_BITMAP_SIZE       8       // 8 * 64 = 512 priority levels (we use 140)
+#define SCHED_TIMESLICE_BASE    100     // Base timeslice in ms
+#define SCHED_TIMESLICE_MIN     10      // Minimum timeslice
+#define SCHED_TIMESLICE_MAX     200     // Maximum timeslice
+
+// Priority to timeslice mapping
+#define PRIO_TO_TIMESLICE(p)    (SCHED_TIMESLICE_BASE + (120 - (p)))
+
+// ============================================================================
+// RUN QUEUE STRUCTURE
+// ============================================================================
+
+// Per-priority queue
+typedef struct prio_queue {
+    struct list_head    tasks;          // List of tasks at this priority
+    int                 count;          // Number of tasks
+} prio_queue_t;
+
+// Per-CPU run queue
+typedef struct runqueue {
+    spinlock_t          lock;
+    
+    // O(1) scheduling structures
+    u64                 bitmap[SCHED_BITMAP_SIZE];  // Priority bitmap
+    prio_queue_t        queues[MAX_PRIO];           // Priority queues (140 levels)
+    
+    // Active/expired arrays for round-robin within priority
+    prio_queue_t        *active;
+    prio_queue_t        *expired;
+    prio_queue_t        arrays[2][MAX_PRIO];
+    u64                 active_bitmap[SCHED_BITMAP_SIZE];
+    u64                 expired_bitmap[SCHED_BITMAP_SIZE];
+    
+    // Current task
+    task_struct_t       *curr;
+    task_struct_t       *idle;
+    
+    // Statistics
+    u64                 nr_running;
+    u64                 nr_switches;
+    u64                 nr_migrations;
+    
+    // CPU info
+    int                 cpu;
+    
+    // Load balancing
+    u64                 load;
+    u64                 calc_load_update;
+    
+    // Tick accounting
+    u64                 clock;
+    u64                 clock_task;
+    
+} runqueue_t;
+
+// Per-CPU run queues
+static runqueue_t runqueues[NR_CPUS];
+
+// ============================================================================
+// BITMAP OPERATIONS
+// ============================================================================
+
+static inline int find_first_set_bit(u64 bitmap[SCHED_BITMAP_SIZE]) {
+    for (int i = 0; i < SCHED_BITMAP_SIZE; i++) {
+        if (bitmap[i]) {
+            return i * 64 + __builtin_ctzll(bitmap[i]);
+        }
+    }
+    return -1;  // No bits set
+}
+
+static inline void set_prio_bit(u64 bitmap[SCHED_BITMAP_SIZE], int prio) {
+    bitmap[prio / 64] |= (1ULL << (prio % 64));
+}
+
+static inline void clear_prio_bit(u64 bitmap[SCHED_BITMAP_SIZE], int prio) {
+    bitmap[prio / 64] &= ~(1ULL << (prio % 64));
+}
+
+static inline int test_prio_bit(u64 bitmap[SCHED_BITMAP_SIZE], int prio) {
+    return (bitmap[prio / 64] >> (prio % 64)) & 1;
+}
+
+// ============================================================================
+// PRIORITY CALCULATION
+// ============================================================================
+
+// Calculate effective priority based on nice value and CPU usage
+static int effective_prio(task_struct_t *task) {
+    int prio = task->static_prio;
+    
+    // Real-time tasks get their RT priority
+    if (task->policy == SCHED_FIFO || task->policy == SCHED_RR) {
+        return MAX_RT_PRIO - 1 - task->rt_priority;
+    }
+    
+    // Normal tasks: static priority + dynamic bonus/penalty
+    // Based on sleep/CPU ratio
+    // TODO: Implement interactivity bonus
+    
+    return prio;
+}
+
+// Calculate time slice based on priority
+static u64 calculate_timeslice(task_struct_t *task) {
+    int prio = task->prio;
+    u64 timeslice;
+    
+    if (prio < MAX_RT_PRIO) {
+        // RT tasks get longer slices
+        timeslice = SCHED_TIMESLICE_MAX;
+    } else {
+        // Nice-based timeslice
+        int nice = prio - 120;  // Nice 0 = prio 120
+        if (nice >= 0) {
+            timeslice = SCHED_TIMESLICE_BASE - (nice * 5);
+        } else {
+            timeslice = SCHED_TIMESLICE_BASE - (nice * 5);
+        }
+    }
+    
+    if (timeslice < SCHED_TIMESLICE_MIN) timeslice = SCHED_TIMESLICE_MIN;
+    if (timeslice > SCHED_TIMESLICE_MAX) timeslice = SCHED_TIMESLICE_MAX;
+    
+    return timeslice;
+}
+
+// ============================================================================
+// ENQUEUE / DEQUEUE
+// ============================================================================
+
+// External spinlock functions
+
+static void enqueue_task(runqueue_t *rq, task_struct_t *task) {
+    int prio = task->prio;
+    
+    prio_queue_t *queue = &rq->active[prio];
+    
+    list_add_tail(&task->run_list, &queue->tasks);
+    queue->count++;
+    
+    set_prio_bit(rq->active_bitmap, prio);
+    
+    rq->nr_running++;
+    task->on_rq = 1;
+    
+    // Update load
+    rq->load += (MAX_PRIO - prio);
+}
+
+static void dequeue_task(runqueue_t *rq, task_struct_t *task) {
+    int prio = task->prio;
+
+    prio_queue_t *queue = &rq->active[prio];
+    
+    list_del(&task->run_list);
+    queue->count--;
+    
+    if (queue->count == 0) {
+        clear_prio_bit(rq->active_bitmap, prio);
+    }
+    
+    rq->nr_running--;
+    task->on_rq = 0;
+    
+    // Update load
+    rq->load -= (MAX_PRIO - prio);
+}
+
+// Move task to expired array
+static void expire_task(runqueue_t *rq, task_struct_t *task) {
+    int prio = task->prio;
+    prio_queue_t *exp_queue = &rq->expired[prio];
+    
+    /* NOTE: caller (schedule_impl) already dequeued this task from active.
+     * We just need to add it to the expired queue. */
+    // Add to expired
+    list_add_tail(&task->run_list, &exp_queue->tasks);
+    exp_queue->count++;
+    set_prio_bit(rq->expired_bitmap, prio);
+    
+    rq->nr_running++;
+    task->on_rq = 1;
+    
+    // Recalculate timeslice
+    task->time_slice = calculate_timeslice(task);
+}
+
+// Swap active and expired arrays
+static void swap_arrays(runqueue_t *rq) {
+    prio_queue_t *tmp = rq->active;
+    rq->active = rq->expired;
+    rq->expired = tmp;
+    
+    // Swap bitmaps
+    for (int i = 0; i < SCHED_BITMAP_SIZE; i++) {
+        u64 t = rq->active_bitmap[i];
+        rq->active_bitmap[i] = rq->expired_bitmap[i];
+        rq->expired_bitmap[i] = t;
+    }
+}
+
+// ============================================================================
+// SCHEDULER CORE
+// ============================================================================
+
+// Pick next task to run (O(1) complexity)
+/* Public: enqueue a task onto the BSP runqueue.
+ * Used by wake_up_process, create_init_task, and task_create. */
+void sched_enqueue_task(task_struct_t *task) {
+    if (!task || task->on_rq) return;
+    runqueue_t *rq = &runqueues[0];  /* BSP always for new tasks */
+
+    spin_lock(&rq->lock);
+    if (!task->on_rq) {
+        enqueue_task(rq, task);
+    }
+    spin_unlock(&rq->lock);
+}
+
+static task_struct_t *pick_next_task(runqueue_t *rq) {
+    // Find highest priority with runnable tasks
+    int prio = find_first_set_bit(rq->active_bitmap);
+
+    if (prio < 0) {
+        // No active tasks - swap arrays if expired has tasks
+        prio = find_first_set_bit(rq->expired_bitmap);
+        if (prio >= 0) {
+            swap_arrays(rq);
+            prio = find_first_set_bit(rq->active_bitmap);
+        }
+    }
+    
+    if (prio < 0) {
+        return rq->idle;
+    }
+    
+    // Get first task from this priority queue
+    prio_queue_t *queue = &rq->active[prio];
+    if (list_empty(&queue->tasks)) {
+        return rq->idle;
+    }
+    
+    task_struct_t *task = list_first_entry(&queue->tasks, task_struct_t, run_list);
+    return task;
+}
+
+// Main scheduler function
+void schedule_impl(void) {
+    /* Disable interrupts for the duration of scheduling decisions.
+     * Re-enabled by iretq when context_switch returns to the new task. */
+    u64 flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags));
+
+    int cpu = smp_processor_id();
+    runqueue_t *rq = &runqueues[cpu];
+    task_struct_t *prev = rq->curr;
+    task_struct_t *next;
+    
+    spin_lock(&rq->lock);
+    
+    // Handle previous task: dequeue it so pick_next_task sees other tasks
+    if (prev && prev != rq->idle && prev->on_rq) {
+        dequeue_task(rq, prev);
+    }
+    
+    // Pick next task
+    next = pick_next_task(rq);
+
+    // Re-enqueue prev if still runnable (round-robin)
+    if (prev && prev != rq->idle) {
+        if (prev->state == TASK_RUNNING) {
+            if (prev->time_slice <= 0) {
+                prev->time_slice = 100;  // reset timeslice
+                expire_task(rq, prev);   // move to expired (lower priority next round)
+            } else {
+                enqueue_task(rq, prev);  // re-add to tail (fair round-robin)
+            }
+        }
+        // If not TASK_RUNNING: leave it off the runqueue (sleeping/zombie)
+    }
+    
+    rq->nr_switches++;
+    rq->clock++;
+    
+    if (!next || next == rq->idle) {
+        /* No runnable task: stay on current or idle-loop */
+        rq->curr = prev ? prev : rq->idle;
+        spin_unlock(&rq->lock);
+        /* Restore interrupt flag and return — CPU will HLT in idle loop */
+        __asm__ volatile("push %0; popfq" :: "r"(flags));
+        return;
+    }
+
+    if (next != prev) {
+        rq->curr = next;
+        spin_unlock(&rq->lock);
+        
+        // Update TSS RSP0 (for interrupts/exceptions from ring-3)
+        // and per-CPU kernel_rsp (for SYSCALL instruction) to use
+        // the correct kernel stack for the next task.
+        if (next->stack) {
+            extern void tss_set_rsp0(u64 rsp0);
+            extern void percpu_set_kernel_rsp(u64 rsp);
+            tss_set_rsp0((u64)next->stack);
+            percpu_set_kernel_rsp((u64)next->stack);
+        }
+
+        // Also switch CR3 if the next task has a different address space
+        if (next->mm && (!prev || !prev->mm || prev->mm->pgd != next->mm->pgd)) {
+            write_cr3((u64)next->mm->pgd);
+        } else if (!next->mm && prev && prev->mm) {
+            // Kernel thread: borrow kernel PML4
+            extern u64 *kernel_pml4;
+            write_cr3((u64)kernel_pml4);
+        }
+
+        // Update current task pointer before switching
+        current_tasks[smp_processor_id()] = next;
+
+        // Save FS.base of outgoing task, load FS.base of incoming task
+        if (prev && prev->mm) {
+            u32 lo, hi;
+            __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100UL));
+            prev->tls = ((u64)hi << 32) | lo;
+        }
+        if (next->tls) {
+            __asm__ volatile("wrmsr" :: "c"(0xC0000100UL),
+                             "a"((u32)(next->tls)), "d"((u32)(next->tls >> 32)));
+        } else {
+            /* Zero FS.base for kernel threads / tasks without TLS */
+            __asm__ volatile("wrmsr" :: "c"(0xC0000100UL), "a"(0), "d"(0));
+        }
+
+        // Context switch
+        if (prev) {
+            context_switch(&prev->context, &next->context);
+        } else {
+            /* Cold start: no previous task to save. Switch to next directly. */
+            current_tasks[smp_processor_id()] = next;
+            if (next->stack) {
+                extern void tss_set_rsp0(u64 rsp0);
+                extern void percpu_set_kernel_rsp(u64 rsp);
+                tss_set_rsp0((u64)next->stack);
+                percpu_set_kernel_rsp((u64)next->stack);
+            }
+            /* Jump to next.rip with next.rsp — a one-way trip */
+            __asm__ volatile(
+                "mov %0, %%rsp\n\t"
+                "push %1\n\t"   /* push rip so ret lands there */
+                "xor %%rbp, %%rbp\n\t"
+                "ret\n\t"
+                :
+                : "r"(next->context.rsp), "r"(next->context.rip)
+                : "memory"
+            );
+            __builtin_unreachable();
+        }
+    } else {
+        spin_unlock(&rq->lock);
+        /* Restore interrupt flag since we're not switching */
+        __asm__ volatile("push %0; popfq" :: "r"(flags));
+    }
+}
+
+// Timer tick handler
+void scheduler_tick(void) {
+    int cpu = smp_processor_id();
+    runqueue_t *rq = &runqueues[cpu];
+    task_struct_t *curr = rq->curr;
+
+    if (!curr || curr == rq->idle) {
+        /* Idle CPU: try to steal work */
+        sched_load_balance();
+        return;
+    }
+
+    /* Decrement timeslice */
+    if (curr->time_slice > 0)
+        curr->time_slice--;
+
+    /* Update runtime accounting */
+    curr->sum_exec_runtime++;
+
+    /* Periodic load balancing */
+    sched_load_balance();
+
+    /* Update EWMA load averages */
+    sched_update_load();
+}
+
+// ============================================================================
+// TASK WAKEUP
+// ============================================================================
+
+void sched_wake_up(task_struct_t *task) {
+    if (!task) return;
+    
+    int cpu = task->cpu;
+    runqueue_t *rq = &runqueues[cpu];
+    
+    spin_lock(&rq->lock);
+    
+    if (task->state != TASK_RUNNING) {
+        task->state = TASK_RUNNING;
+        task->prio = effective_prio(task);
+        task->time_slice = calculate_timeslice(task);
+        
+        enqueue_task(rq, task);
+    }
+    
+    spin_unlock(&rq->lock);
+}
+
+// ============================================================================
+// SLEEP/BLOCK
+// ============================================================================
+
+void sched_sleep(long state) {
+    int cpu = smp_processor_id();
+    runqueue_t *rq = &runqueues[cpu];
+    task_struct_t *task = rq->curr;
+    
+    spin_lock(&rq->lock);
+    task->state = state;
+    spin_unlock(&rq->lock);
+    
+    schedule_impl();
+}
+
+// ============================================================================
+// YIELD
+// ============================================================================
+
+void sched_yield_impl(void) {
+    int cpu = smp_processor_id();
+    runqueue_t *rq = &runqueues[cpu];
+    task_struct_t *task = rq->curr;
+    
+    if (task) {
+        task->time_slice = 0;
+    }
+    
+    schedule_impl();
+}
+
+// ============================================================================
+// SETPRIORITY / NICE
+// ============================================================================
+
+int sched_setscheduler(task_struct_t *task, int policy, int prio) {
+    if (!task) return -EINVAL;
+    
+    int cpu = task->cpu;
+    runqueue_t *rq = &runqueues[cpu];
+    
+    spin_lock(&rq->lock);
+    
+    bool on_rq = task->on_rq;
+    if (on_rq) {
+        dequeue_task(rq, task);
+    }
+    
+    task->policy = policy;
+    
+    switch (policy) {
+    case SCHED_FIFO:
+    case SCHED_RR:
+        task->rt_priority = prio;
+        task->prio = MAX_RT_PRIO - 1 - prio;
+        break;
+    case SCHED_NORMAL:
+    case SCHED_BATCH:
+    case SCHED_IDLE:
+        task->static_prio = 120 + prio;  // prio is nice value (-20 to 19)
+        task->prio = effective_prio(task);
+        break;
+    default:
+        spin_unlock(&rq->lock);
+        return -EINVAL;
+    }
+    
+    task->time_slice = calculate_timeslice(task);
+    
+    if (on_rq) {
+        enqueue_task(rq, task);
+    }
+    
+    spin_unlock(&rq->lock);
+    return 0;
+}
+
+int sched_set_nice(task_struct_t *task, int nice) {
+    if (nice < MIN_NICE) nice = MIN_NICE;
+    if (nice > MAX_NICE) nice = MAX_NICE;
+    
+    return sched_setscheduler(task, task->policy, nice);
+}
+
+// ============================================================================
+// LOAD BALANCING (for SMP)
+// ============================================================================
+// LOAD BALANCING
+// ============================================================================
+
+/* Minimum load difference before we bother migrating (prevents thrashing) */
+#define LB_IMBALANCE_MIN    20
+/* Max tasks to pull in one balance pass (limits latency spike) */
+#define LB_PULL_MAX         4
+/* Balance interval: every 200ms (200 ticks at 1000Hz) */
+#define LB_INTERVAL_TICKS   200
+
+/* Per-CPU tick counter for staggered balance intervals */
+static u64 lb_next_balance[NR_CPUS];
+
+/* -----------------------------------------------------------------------
+ * Double-lock helper: always acquire locks in cpu-index order to prevent
+ * deadlock between two CPUs trying to balance against each other.
+ * ----------------------------------------------------------------------- */
+static void rq_lock_pair(runqueue_t *a, runqueue_t *b) {
+    if (a->cpu < b->cpu) {
+        spin_lock(&a->lock);
+        spin_lock(&b->lock);
+    } else {
+        spin_lock(&b->lock);
+        spin_lock(&a->lock);
+    }
+}
+
+static void rq_unlock_pair(runqueue_t *a, runqueue_t *b) {
+    spin_unlock(&a->lock);
+    spin_unlock(&b->lock);
+}
+
+/* -----------------------------------------------------------------------
+ * task_migrate: atomically move 'task' from src_rq to dst_rq.
+ * Called with BOTH rq locks held.
+ * ----------------------------------------------------------------------- */
+static void task_migrate(task_struct_t *task, runqueue_t *src_rq, runqueue_t *dst_rq) {
+    /* Pull task off source */
+    if (task->on_rq) {
+        int prio = task->prio;
+        prio_queue_t *q = &src_rq->active[prio];
+        list_del(&task->run_list);
+        q->count--;
+        if (q->count == 0)
+            clear_prio_bit(src_rq->active_bitmap, prio);
+        src_rq->nr_running--;
+        src_rq->load -= (MAX_PRIO - prio);
+        task->on_rq = 0;
+    }
+
+    /* Update task's CPU affiliation */
+    task->cpu = dst_rq->cpu;
+
+    /* Push task onto destination's active queue */
+    enqueue_task(dst_rq, task);
+    dst_rq->nr_migrations++;
+    src_rq->nr_migrations++;
+}
+
+/* -----------------------------------------------------------------------
+ * find_migratable: walk src_rq's active array and find a task that:
+ *   - is not currently running (not src_rq->curr)
+ *   - is allowed to run on dst cpu (cpus_allowed bitmask)
+ *   - is not pinned to its current cpu
+ * Returns NULL if nothing suitable found.
+ * ----------------------------------------------------------------------- */
+static task_struct_t *find_migratable(runqueue_t *src_rq, int dst_cpu) {
+    /* Walk priority levels from lowest (best to migrate) to highest */
+    for (int prio = MAX_PRIO - 1; prio >= 0; prio--) {
+        prio_queue_t *q = &src_rq->active[prio];
+        if (q->count == 0) continue;
+
+        task_struct_t *pos;
+        list_for_each_entry(pos, &q->tasks, run_list) {
+            if (pos == src_rq->curr) continue;          /* running — skip */
+            if (pos == src_rq->idle) continue;          /* idle task — skip */
+            if (pos->state != TASK_RUNNING) continue;   /* sleeping — skip */
+            /* Check CPU affinity: bit dst_cpu must be set */
+            if (pos->cpus_allowed &&
+                !(pos->cpus_allowed & (1ULL << (unsigned)dst_cpu)))
+                continue;
+            return pos;
+        }
+    }
+    return NULL;
+}
+
+/* -----------------------------------------------------------------------
+ * find_busiest_queue: return the most loaded online CPU that has more
+ * load than us + LB_IMBALANCE_MIN.  Returns NULL if none qualify.
+ * ----------------------------------------------------------------------- */
+static runqueue_t *find_busiest_queue(int this_cpu) {
+    runqueue_t *busiest = NULL;
+    u64 max_load = runqueues[this_cpu].load + LB_IMBALANCE_MIN;
+
+    for (int cpu = 0; cpu < NR_CPUS; cpu++) {
+        if (cpu == this_cpu) continue;
+        if (!runqueues[cpu].idle) continue;      /* CPU not yet online */
+        if (runqueues[cpu].nr_running <= 1) continue; /* only idle — nothing to pull */
+
+        if (runqueues[cpu].load > max_load) {
+            max_load = runqueues[cpu].load;
+            busiest = &runqueues[cpu];
+        }
+    }
+    return busiest;
+}
+
+/* -----------------------------------------------------------------------
+ * sched_load_balance: pull-based load balancing.
+ *
+ * Called from scheduler_tick() on each CPU.  Each CPU tries to pull work
+ * from the busiest CPU if there is a meaningful imbalance.
+ *
+ * We use a staggered interval (per-CPU lb_next_balance) so not every CPU
+ * runs the balance check on the same tick.
+ * ----------------------------------------------------------------------- */
+void sched_load_balance(void) {
+    extern volatile u64 jiffies;
+    int this_cpu = smp_processor_id();
+    runqueue_t *this_rq = &runqueues[this_cpu];
+
+    /* Staggered interval check */
+    if ((s64)(jiffies - lb_next_balance[this_cpu]) < 0)
+        return;
+    /* Schedule next balance pass, staggered by cpu index to avoid thundering herd */
+    lb_next_balance[this_cpu] = jiffies + LB_INTERVAL_TICKS + (u64)this_cpu * 7;
+
+    /* Find the busiest runqueue that has tasks we can steal */
+    runqueue_t *src_rq = find_busiest_queue(this_cpu);
+    if (!src_rq) return;
+
+    int pulled = 0;
+
+    rq_lock_pair(this_rq, src_rq);
+
+    while (pulled < LB_PULL_MAX) {
+        /* Re-check imbalance under lock (things may have changed) */
+        if (src_rq->load <= this_rq->load + LB_IMBALANCE_MIN)
+            break;
+        if (src_rq->nr_running <= 1)
+            break;
+
+        task_struct_t *task = find_migratable(src_rq, this_cpu);
+        if (!task) break;
+
+        task_migrate(task, src_rq, this_rq);
+        pulled++;
+    }
+
+    rq_unlock_pair(this_rq, src_rq);
+
+    if (pulled > 0) {
+        printk(KERN_DEBUG "[lb] CPU%d pulled %d task(s) from CPU%d "
+               "(load: %llu→%llu vs src %llu)\n",
+               this_cpu, pulled, src_rq->cpu,
+               this_rq->load - pulled * 0 /* approx */, this_rq->load,
+               src_rq->load);
+    }
+}
+
+// ============================================================================
+// ============================================================================
+// PER-CPU ACCESSORS (for /proc/stat, /proc/loadavg, etc.)
+// ============================================================================
+
+/* EWMA load averages — updated every 5 seconds (5000 ticks at 1kHz)
+ * Uses the standard Unix 1/5/15-minute decay constants:
+ *   α_1min  = e^(-5/60)   ≈ 1/2^3  (fixed-point: shift 11)
+ *   α_5min  = e^(-5/300)  ≈ 1/2^6
+ *   α_15min = e^(-5/900)  ≈ 1/2^8
+ *
+ * load_avg is stored as fixed-point (× 2048) to give two decimal places.
+ */
+#define LOAD_FREQ       5000        /* update every 5000 ticks */
+#define FIXED_1         (1 << 11)   /* 2048 */
+
+static u64 load_avg_1  = 0;  /* × FIXED_1 */
+static u64 load_avg_5  = 0;
+static u64 load_avg_15 = 0;
+static u64 load_next_update = 0;
+
+static void update_load_averages(void) {
+    extern volatile u64 jiffies;
+    if ((s64)(jiffies - load_next_update) < 0) return;
+    load_next_update = jiffies + LOAD_FREQ;
+
+    /* Count total running tasks across all online CPUs */
+    u64 nr_active = 0;
+    for (int i = 0; i < NR_CPUS; i++) {
+        if (!runqueues[i].idle) continue;
+        if (runqueues[i].nr_running > 0)
+            nr_active += runqueues[i].nr_running - 1; /* subtract idle */
+    }
+    u64 n = nr_active * FIXED_1;
+
+    /* EWMA: new = old + (n - old) * alpha */
+    /* α ≈ 1 - e^(-5/60) ≈ 1/8  (approximated as shift) */
+    load_avg_1  += (n > load_avg_1)  ? (n - load_avg_1)  >> 3
+                                     : -(((load_avg_1  - n) >> 3));
+    load_avg_5  += (n > load_avg_5)  ? (n - load_avg_5)  >> 6
+                                     : -(((load_avg_5  - n) >> 6));
+    load_avg_15 += (n > load_avg_15) ? (n - load_avg_15) >> 8
+                                     : -(((load_avg_15 - n) >> 8));
+}
+
+/* Called from scheduler_tick to keep averages up to date */
+static inline void sched_update_load(void) {
+    update_load_averages();
+}
+
+u64 sched_get_cpu_nr_running(int cpu) {
+    if (cpu < 0 || cpu >= NR_CPUS || !runqueues[cpu].idle) return 0;
+    return runqueues[cpu].nr_running;
+}
+
+u64 sched_get_cpu_nr_switches(int cpu) {
+    if (cpu < 0 || cpu >= NR_CPUS || !runqueues[cpu].idle) return 0;
+    return runqueues[cpu].nr_switches;
+}
+
+u64 sched_get_cpu_load(int cpu) {
+    if (cpu < 0 || cpu >= NR_CPUS || !runqueues[cpu].idle) return 0;
+    return runqueues[cpu].load;
+}
+
+int sched_get_num_online_cpus(void) {
+    int n = 0;
+    for (int i = 0; i < NR_CPUS; i++)
+        if (runqueues[i].idle) n++;
+    return n ? n : 1;
+}
+
+/* Fill a buffer with "1.23 4.56 7.89 running/total last_pid\n" */
+size_t sched_gen_loadavg(char *buf, size_t size) {
+    update_load_averages();
+    u64 a1  = load_avg_1  / FIXED_1;
+    u64 f1  = (load_avg_1  * 100 / FIXED_1) % 100;
+    u64 a5  = load_avg_5  / FIXED_1;
+    u64 f5  = (load_avg_5  * 100 / FIXED_1) % 100;
+    u64 a15 = load_avg_15 / FIXED_1;
+    u64 f15 = (load_avg_15 * 100 / FIXED_1) % 100;
+
+    u32 running = kernel_state.running_tasks;
+    u32 total   = kernel_state.total_tasks;
+    if (total == 0) total = 1;
+
+    extern task_struct_t *get_current_task(void);
+    task_struct_t *ct = get_current_task();
+    pid_t last = ct ? ct->pid : 1;
+
+    return (size_t)snprintf(buf, size, "%llu.%02llu %llu.%02llu %llu.%02llu %u/%u %d\n",
+                            a1, f1, a5, f5, a15, f15, running, total, (int)last);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+void sched_init_rq(int cpu) {
+    runqueue_t *rq = &runqueues[cpu];
+    
+    memset(rq, 0, sizeof(runqueue_t));
+    spin_lock_init(&rq->lock);
+    
+    // Initialize priority queues
+    for (int i = 0; i < MAX_PRIO; i++) {
+        INIT_LIST_HEAD(&rq->arrays[0][i].tasks);
+        INIT_LIST_HEAD(&rq->arrays[1][i].tasks);
+        rq->arrays[0][i].count = 0;
+        rq->arrays[1][i].count = 0;
+    }
+    
+    rq->active = rq->arrays[0];
+    rq->expired = rq->arrays[1];
+    
+    rq->cpu = cpu;
+    rq->nr_running = 0;
+    rq->nr_switches = 0;
+    
+    // Idle task will be set later
+    rq->idle = NULL;
+    rq->curr = NULL;
+}
+
+void sched_set_idle(int cpu, task_struct_t *idle) {
+    runqueues[cpu].idle = idle;
+    runqueues[cpu].curr = idle;
+}
+
+void o1_sched_init(void) {
+    printk(KERN_INFO "Initializing O(1) scheduler...\n");
+    
+    for (int cpu = 0; cpu < NR_CPUS; cpu++) {
+        sched_init_rq(cpu);
+    }
+    
+    printk(KERN_INFO "  O(1) scheduler initialized (%d priority levels)\n", MAX_PRIO);
+}
+
+// ============================================================================
+// DEBUG / STATS
+// ============================================================================
+
+void sched_print_stats(void) {
+    for (int cpu = 0; cpu < 1; cpu++) {  // Just BSP for now
+        runqueue_t *rq = &runqueues[cpu];
+        
+        printk(KERN_INFO "CPU %d: running=%lu switches=%lu load=%lu\n",
+               cpu, rq->nr_running, rq->nr_switches, rq->load);
+    }
+}
+
+// Count runnable tasks at each priority level
+void sched_print_prio_stats(void) {
+    runqueue_t *rq = &runqueues[0];
+    
+    printk(KERN_INFO "Priority distribution:\n");
+    for (int p = 0; p < MAX_PRIO; p++) {
+        int active = rq->active[p].count;
+        int expired = rq->expired[p].count;
+        if (active || expired) {
+            printk(KERN_INFO "  Prio %d: active=%d expired=%d\n", 
+                   p, active, expired);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-AP scheduler initialization - called from ap_entry64()          */
+/* ------------------------------------------------------------------ */
+void sched_init_ap(u32 cpu) {
+    if (cpu >= NR_CPUS) return;
+    sched_init_rq((int)cpu);
+    printk(KERN_INFO "  SCHED: CPU%u runqueue initialized\n", cpu);
+    /* AP starts with curr=NULL; first schedule() call will pick idle  */
+}
